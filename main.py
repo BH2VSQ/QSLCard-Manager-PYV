@@ -21,11 +21,6 @@ from PyQt5.QtPrintSupport import QPrinter, QPrintDialog
 # --- Third-party library dependency check (will be handled in main) ---
 try:
     import adif_io
-    import serial
-    import serial.tools.list_ports
-    import nfc
-    from nfc.clf import RemoteTarget
-    import ndef
     import qrcode
     from reportlab.pdfgen import canvas
     from reportlab.lib.pagesizes import mm
@@ -46,19 +41,23 @@ STYLE_SHEET_FILE = "assets/style.qss"
 CONFIG_FILE = "config.json"
 LABELS_DIR = "labels"
 MODES_LIST = ["", "AM", "ARDOP", "ATV", "C4FM", "CHIP", "CLO", "CW", "DIGITALVOICE", "DOMINO", "DSTAR", "FAX", "FM", "FSK441", "FT8", "FT4", "HELL", "JT4", "JT6M", "JT9", "JT44", "JT65", "MFSK", "MSK144", "MT63", "OLIVIA", "OPERA", "PACKET", "PAX", "PSK", "PSK2K", "Q15", "QRA64", "ROS", "RTTY", "RTTYM", "SSB", "SSTV", "THOR", "THRB", "V4", "V5", "VOI", "WINMOR", "WSPR", "AMSS", "ASCI", "PCW", "EYEBALL"]
-
+FREQ_BAND_MAP = {
+    (1.8, 2.0): "160m", (3.5, 4.0): "80m", (5.0, 5.6): "60m", (7.0, 7.3): "40m",
+    (10.1, 10.15): "30m", (14.0, 14.35): "20m", (18.068, 18.168): "17m",
+    (21.0, 21.45): "15m", (24.89, 24.99): "12m", (28.0, 29.7): "10m",
+    (50, 54): "6m", (144, 148): "2m", (222, 225): "1.25m", (420, 450): "70cm",
+    (902, 928): "33cm", (1240, 1300): "23cm"
+}
 
 # --- Configuration Manager ---
 class ConfigManager:
     @staticmethod
     def load_config():
-        default_config = {"primary_callsign": "", "nfc_port": ""}
+        default_config = {"primary_callsign": ""}
         if not os.path.exists(CONFIG_FILE): return default_config
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-                if 'nfc_port' not in config: config['nfc_port'] = ""
-                return config
+                return json.load(f)
         except (IOError, json.JSONDecodeError): return default_config
 
     @staticmethod
@@ -95,81 +94,7 @@ class ADIF_Handler:
             with open(LOGBOOK_FILE, "a", encoding="utf-8") as f: f.write(adif_record)
         except IOError as e: print(f"Error writing to logbook file: {e}")
 
-# --- Hardware Components ---
-class NFCWriter(QThread):
-    status_update = pyqtSignal(str)
-    write_finished = pyqtSignal(bool, str) # success, message
-
-    def __init__(self, port, data, parent=None):
-        super().__init__(parent)
-        self.port = port
-        self.data_to_write = data
-        self._is_running = False
-
-    def run(self):
-        self._is_running = True
-        try:
-            self.status_update.emit("正在连接NFC读写器...")
-            with nfc.ContactlessFrontend(self.port) as clf:
-                self.status_update.emit("连接成功，请放置NFC卡片...")
-                target = clf.sense(RemoteTarget('106A'), RemoteTarget('106B'), RemoteTarget('212F'))
-                while target is None and self._is_running:
-                    target = clf.sense(RemoteTarget('106A'), RemoteTarget('106B'), RemoteTarget('212F'))
-                
-                if not self._is_running:
-                    self.write_finished.emit(False, "操作已取消。")
-                    return
-
-                self.status_update.emit("发现卡片，正在写入...")
-                tag = nfc.tag.activate(clf, target)
-                if tag.ndef:
-                    tag.ndef.records = [ndef.TextRecord(self.data_to_write)]
-                    self.write_finished.emit(True, "NFC 标签写入成功！")
-                else:
-                    self.write_finished.emit(False, "错误：该卡片不支持NDEF格式。")
-
-        except IOError as e:
-            self.write_finished.emit(False, f"连接读写器失败: {e}")
-        except Exception as e:
-            self.write_finished.emit(False, f"写入失败: {e}")
-
-    def stop(self):
-        self._is_running = False
-
-class NFCScanner(QThread):
-    tag_read = pyqtSignal(str)
-    status_update = pyqtSignal(str)
-
-    def __init__(self, port, parent=None):
-        super().__init__(parent)
-        self.port = port
-        self._is_running = False
-
-    def run(self):
-        self._is_running = True
-        try:
-            with nfc.ContactlessFrontend(self.port) as clf:
-                self.status_update.emit("NFC 扫描已激活，请放置卡片。")
-                while self._is_running:
-                    target = clf.sense(RemoteTarget('106A'), RemoteTarget('106B'), RemoteTarget('212F'), interval=0.5)
-                    if target:
-                        try:
-                            tag = nfc.tag.activate(clf, target)
-                            if tag.ndef and tag.ndef.records:
-                                record = ndef.message_decoder(tag.ndef.data)
-                                if isinstance(record[0], ndef.TextRecord):
-                                    self.tag_read.emit(record[0].text)
-                        except Exception as e:
-                            print(f"Error reading NFC tag: {e}")
-                    QThread.msleep(100) 
-        except IOError:
-            self.status_update.emit(f"无法连接到NFC设备: {self.port}")
-        except Exception as e:
-            self.status_update.emit(f"NFC扫描出错: {e}")
-
-    def stop(self):
-        self._is_running = False
-
+# --- Label Printer ---
 class LabelPrinter:
     @staticmethod
     def generate_label(qsl_id, log_data_list, parent_widget, output_mode="print"):
@@ -407,10 +332,12 @@ class LogDetailDialog(QDialog):
         self.qso_type_combo.currentIndexChanged.connect(self.update_form_layout)
         type_layout = QFormLayout(); type_layout.addRow("通联类型:", self.qso_type_combo); layout.addLayout(type_layout)
         self.form_layout = QFormLayout()
-        self.callsign_input = QLineEdit(); self.qso_date_input = QDateEdit(); self.qso_date_input.setDisplayFormat("yyyy-MM-dd")
+        self.callsign_input = QLineEdit(); self.callsign_input.textChanged.connect(self.force_uppercase_callsign)
+        self.qso_date_input = QDateEdit(); self.qso_date_input.setDisplayFormat("yyyy-MM-dd")
         self.time_on_input = QLineEdit(); self.band_input = QComboBox(); self.band_input.addItems(["", "160m", "80m", "60m", "40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m", "4m", "2m", "1.25m", "70cm", "33cm", "23cm", "13cm", "9cm", "6cm", "3cm", "1.25cm", "N/A"])
         self.band_rx_input = QComboBox(); self.band_rx_input.addItems(["", "160m", "80m", "60m", "40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m", "4m", "2m", "1.25m", "70cm", "33cm", "23cm", "13cm", "9cm", "6cm", "3cm", "1.25cm", "N/A"])
-        self.freq_input = QLineEdit(); self.freq_rx_input = QLineEdit();
+        self.freq_input = QLineEdit(); self.freq_input.editingFinished.connect(self.update_band_from_freq)
+        self.freq_rx_input = QLineEdit();
         self.mode_input = QComboBox(); self.mode_input.addItems(MODES_LIST)
         self.rst_sent_input = QLineEdit(); self.rst_rcvd_input = QLineEdit(); self.comment_input = QTextEdit()
         self.form_layout.addRow("对方呼号:", self.callsign_input); self.form_layout.addRow("日期 (UTC):", self.qso_date_input)
@@ -428,6 +355,20 @@ class LogDetailDialog(QDialog):
             qsl_layout.addRow("收卡 (RC) 编号:", self.rc_card_label); qsl_layout.addRow("发卡 (TC) 编号:", self.tc_card_label); layout.addWidget(qsl_frame)
         self.buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         self.buttons.accepted.connect(self.accept); self.buttons.rejected.connect(self.reject); layout.addWidget(self.buttons); self.populate_data()
+    
+    def force_uppercase_callsign(self, text):
+        self.callsign_input.setText(text.upper())
+
+    def update_band_from_freq(self):
+        try:
+            freq_mhz = float(self.freq_input.text())
+            for (lower, upper), band in FREQ_BAND_MAP.items():
+                if lower <= freq_mhz <= upper:
+                    self.band_input.setCurrentText(band)
+                    return
+        except ValueError:
+            pass # Ignore if input is not a valid float
+            
     def setup_dynamic_sections(self):
         sat_layout = QFormLayout(self.satellite_frame); self.sat_name_input = QLineEdit(); self.prop_mode_input = QLineEdit()
         sat_layout.addRow("卫星名称:", self.sat_name_input); sat_layout.addRow("传播模式:", self.prop_mode_input)
@@ -573,7 +514,11 @@ class LogManagementWidget(QWidget):
         bottom_button_layout.addWidget(self.check_duplicates_button); bottom_button_layout.addWidget(self.recycle_card_button); bottom_button_layout.addWidget(self.delete_log_button)
         bottom_button_layout.addStretch(); self.back_button = QPushButton("返回主菜单"); bottom_button_layout.addWidget(self.back_button)
         main_layout.addLayout(bottom_button_layout)
-        self.my_callsign_filter.textChanged.connect(self.apply_filters); self.callsign_filter.textChanged.connect(self.apply_filters)
+        self.my_callsign_filter.textChanged.connect(lambda text: self.my_callsign_filter.setText(text.upper()))
+        self.my_callsign_filter.textChanged.connect(self.apply_filters)
+        self.callsign_filter.textChanged.connect(lambda text: self.callsign_filter.setText(text.upper()))
+        self.callsign_filter.textChanged.connect(self.apply_filters)
+        self.qsl_id_filter.textChanged.connect(lambda text: self.qsl_id_filter.setText(text.upper()))
         self.qsl_id_filter.returnPressed.connect(self.apply_filters)
         self.mode_filter.currentIndexChanged.connect(self.apply_filters); self.reset_button.clicked.connect(self.reset_filters)
         self.reorder_button.clicked.connect(self.reorder_logs)
@@ -777,8 +722,6 @@ class HardwareWidget(QWidget):
     def __init__(self, db_manager, parent=None):
         super().__init__(parent)
         self.db_manager = db_manager
-        self.nfc_writer_thread = None
-        self.nfc_scanner_thread = None
         self.init_ui()
 
     def init_ui(self):
@@ -795,39 +738,18 @@ class HardwareWidget(QWidget):
         input_zone = QGroupBox("手动输入")
         input_layout = QVBoxLayout(input_zone)
         self.manual_input = QLineEdit(); self.manual_input.setPlaceholderText("输入QSL卡号后按回车查询...")
+        self.manual_input.textChanged.connect(lambda text: self.manual_input.setText(text.upper()))
         self.manual_input.returnPressed.connect(self.search_manual_code)
         input_layout.addWidget(self.manual_input)
-
-        # NFC Group
-        nfc_frame = QGroupBox("NFC 读/写")
-        nfc_layout = QVBoxLayout(nfc_frame)
-        self.nfc_status_label = QLabel("NFC 空闲")
-        self.nfc_status_label.setAlignment(Qt.AlignCenter)
-        self.nfc_write_button = QPushButton("将输入框内容写入NFC")
-        
-        # NFC Port Settings within the group
-        nfc_port_layout = QHBoxLayout()
-        self.nfc_port_combo = QComboBox()
-        self.refresh_nfc_btn = QPushButton("刷新")
-        nfc_port_layout.addWidget(QLabel("端口:"))
-        nfc_port_layout.addWidget(self.nfc_port_combo, 1)
-        nfc_port_layout.addWidget(self.refresh_nfc_btn)
-        self.save_nfc_btn = QPushButton("保存")
-        nfc_port_layout.addWidget(self.save_nfc_btn)
-        
-        nfc_layout.addLayout(nfc_port_layout)
-        nfc_layout.addWidget(self.nfc_status_label)
-        nfc_layout.addWidget(self.nfc_write_button)
         
         left_layout.addWidget(input_zone)
-        left_layout.addWidget(nfc_frame)
         left_layout.addStretch(1)
 
         # --- Right Pane ---
         right_pane = QGroupBox("查询结果")
         right_layout = QVBoxLayout(right_pane)
         self.results_browser = QTextBrowser()
-        self.results_browser.setStyleSheet("font-size: 28px;") # Increased font size
+        self.results_browser.setStyleSheet("font-size: 28px;") 
         right_layout.addWidget(self.results_browser)
 
         # --- Main Layout Assembly ---
@@ -844,132 +766,64 @@ class HardwareWidget(QWidget):
         top_level_layout.addLayout(back_button_layout)
         
         # Connections
-        self.nfc_write_button.clicked.connect(self.write_nfc)
         self.back_button.clicked.connect(self.leave_view)
         self.back_button.clicked.connect(self.back_to_dashboard_signal.emit)
-        self.refresh_nfc_btn.clicked.connect(self.populate_nfc_ports)
-        self.save_nfc_btn.clicked.connect(self.save_nfc_settings)
         
-    def populate_nfc_ports(self):
-        self.nfc_port_combo.clear()
-        try:
-            ports = serial.tools.list_ports.comports()
-            if not ports:
-                self.nfc_port_combo.addItem("未找到串口设备")
-            else:
-                for port in ports: self.nfc_port_combo.addItem(port.device)
-        except Exception as e:
-            self.nfc_port_combo.addItem("无法扫描串口")
-            print(f"Error scanning for serial ports: {e}")
-
-    def save_nfc_settings(self):
-        port = self.nfc_port_combo.currentText()
-        if port and "未找到" not in port and "无法" not in port:
-            ConfigManager.set_config("nfc_port", port)
-            QMessageBox.information(self, "成功", f"NFC端口已保存为 {port}。")
-            self.start_nfc_scan() # Restart scan with new port
-        else:
-            QMessageBox.warning(self, "无效端口", "请选择一个有效的端口。")
-
     def search_manual_code(self):
-        code = self.manual_input.text().strip()
+        code = self.manual_input.text().strip().upper()
         if code:
             self._perform_search(code)
             self.manual_input.clear()
 
-    def _perform_search(self, qsl_id):
-        logs_for_card = self.db_manager.get_logs_for_qsl_card(qsl_id)
-        if not logs_for_card:
-            self.results_browser.setHtml(f"<h3>未找到与 QSL 卡号相关的日志:</h3><p>{qsl_id}</p>")
-            return
-
-        html = f"<h3>QSL 卡号: {qsl_id}</h3>"
-        html += "<p>关联的通联日志:</p><ul>"
-        for log_row in logs_for_card:
-            log_details = self.db_manager.get_log_details(log_row['log_id'])
-            if log_details:
-                html += (
-                    f"<li><b>呼号:</b> {log_details['station_callsign']} | "
-                    f"<b>日期:</b> {log_details['qso_date']} | "
-                    f"<b>时间:</b> {log_details['time_on']}Z | "
-                    f"<b>波段:</b> {log_details['band']} | "
-                    f"<b>模式:</b> {log_details['mode']}</li>"
-                )
-        html += "</ul>"
-        self.results_browser.setHtml(html)
-
-    def write_nfc(self):
-        if self.nfc_writer_thread and self.nfc_writer_thread.isRunning():
-            self.nfc_writer_thread.stop()
-            self.nfc_writer_thread.wait()
-            self.nfc_write_button.setText("将输入框内容写入NFC")
-            self.nfc_status_label.setText("NFC 空闲")
-            self.start_nfc_scan() # Restart scanning after write attempt
-            return
+    def _perform_search(self, qsl_id_prefix):
+        matching_qsl_cards = self.db_manager.get_logs_for_qsl_id_prefix(qsl_id_prefix)
         
-        port = ConfigManager.get_config("nfc_port")
-        data = self.manual_input.text()
-        if not port:
-            QMessageBox.warning(self, "NFC 未配置", "请先在“设置”中选择并保存PN532端口。")
+        if not matching_qsl_cards:
+            self.results_browser.setHtml(f"<h3>未找到与 QSL 卡号 '{qsl_id_prefix}' 相关的日志。</h3>")
             return
-        if not data: 
-            QMessageBox.warning(self, "信息不完整", "请先在输入框中输入要写入的数据。")
-            return
-        
-        self.stop_nfc_scan() # Stop scanning to avoid conflict
-        self.nfc_writer_thread = NFCWriter(port, data, self)
-        self.nfc_writer_thread.status_update.connect(self.nfc_status_label.setText)
-        self.nfc_writer_thread.write_finished.connect(self.on_nfc_write_finished)
-        self.nfc_write_button.setText("停止写入")
-        self.nfc_writer_thread.start()
 
-    def on_nfc_write_finished(self, success, message):
-        self.nfc_status_label.setText(message)
-        if success:
-            QMessageBox.information(self, "成功", message)
-        else:
-            QMessageBox.warning(self, "失败", message)
-        self.nfc_write_button.setText("将输入框内容写入NFC")
-        self.nfc_writer_thread = None
-        self.start_nfc_scan()
+        full_html = ""
+        for card_row in matching_qsl_cards:
+            full_qsl_id = card_row['qsl_id']
+            full_html += f"<h3>QSL 卡号: {full_qsl_id}</h3>"
+            
+            logs_for_this_card = self.db_manager.get_logs_for_qsl_card(full_qsl_id)
 
+            if logs_for_this_card:
+                full_html += "<p><b>关联的通联日志:</b></p>"
+                for i, log_row in enumerate(logs_for_this_card):
+                    if i > 0: full_html += "<hr>"
+                    log_details = dict(self.db_manager.get_log_details(log_row['log_id']))
+                    if log_details:
+                        details_html = f"""
+                            <p>
+                            <b>对方呼号:</b> {log_details.get('station_callsign', '')}<br>
+                            <b>我方呼号:</b> {log_details.get('my_callsign', '')}<br>
+                            <b>日期/时间 (UTC):</b> {log_details.get('qso_date', '')} / {log_details.get('time_on', '')}Z<br>
+                            <b>频率/波段:</b> {log_details.get('freq', 'N/A')} MHz / {log_details.get('band', 'N/A')}<br>
+                            <b>模式:</b> {log_details.get('mode', '')} {log_details.get('submode', '') or ''}<br>
+                            <b>信号报告 (S/R):</b> {log_details.get('rst_sent', '')} / {log_details.get('rst_rcvd', '')}<br>
+                        """
+                        if log_details.get('sat_name'):
+                            details_html += f"<b>卫星:</b> {log_details['sat_name']}<br>"
+                        if log_details.get('comment'):
+                             details_html += f"<b>备注:</b> {log_details['comment']}"
+                        
+                        details_html += "</p>"
+                        full_html += details_html
+
+            else:
+                full_html += "<p>无关联的通联日志。</p>"
+            full_html += "<hr style='border: 1px solid #7f8c8d;'>"
+
+        self.results_browser.setHtml(full_html.removesuffix("<hr style='border: 1px solid #7f8c8d;'>"))
+    
     def enter_view(self):
-        self.populate_nfc_ports()
-        saved_port = ConfigManager.get_config("nfc_port")
-        if saved_port and self.nfc_port_combo.findText(saved_port) != -1:
-            self.nfc_port_combo.setCurrentText(saved_port)
-        self.start_nfc_scan()
         self.manual_input.setFocus()
 
     def leave_view(self):
-        self.stop_nfc_scan()
-        if self.nfc_writer_thread and self.nfc_writer_thread.isRunning():
-            self.nfc_writer_thread.stop()
-            self.nfc_writer_thread.wait()
         self.manual_input.clear()
         self.results_browser.clear()
-    
-    def on_nfc_tag_read(self, text):
-        self.manual_input.setText(text)
-        QApplication.beep()
-        self._perform_search(text)
-        self.manual_input.clear()
-        
-    def start_nfc_scan(self):
-        self.stop_nfc_scan() # Ensure any previous scan is stopped
-        port = ConfigManager.get_config("nfc_port")
-        if port:
-            self.nfc_scanner_thread = NFCScanner(port, self)
-            self.nfc_scanner_thread.tag_read.connect(self.on_nfc_tag_read)
-            self.nfc_scanner_thread.status_update.connect(self.nfc_status_label.setText)
-            self.nfc_scanner_thread.start()
-
-    def stop_nfc_scan(self):
-        if self.nfc_scanner_thread and self.nfc_scanner_thread.isRunning():
-            self.nfc_scanner_thread.stop()
-            self.nfc_scanner_thread.wait()
-            self.nfc_scanner_thread = None
-            self.nfc_status_label.setText("NFC 空闲")
 
 # --- Main Application Window ---
 class MainWindow(QMainWindow):
@@ -994,13 +848,13 @@ class MainWindow(QMainWindow):
         self.stacked_widget.addWidget(self.log_management_view); self.stacked_widget.addWidget(self.hardware_view)
         self.stacked_widget.setCurrentWidget(self.dashboard_view)
     def show_dashboard(self):
-        self.hardware_view.leave_view() # Ensure threads are stopped
+        self.hardware_view.leave_view() 
         self.log_management_view.reset_filters()
         self.stacked_widget.setCurrentWidget(self.dashboard_view); self.update_dashboard_stats()
     def create_dashboard_view(self):
         self.dashboard_view = QWidget(); self.dashboard_view.setObjectName("dashboard_view"); main_hbox = QHBoxLayout(self.dashboard_view)
         tile_widget = QWidget(); tile_layout = QGridLayout(tile_widget)
-        tiles = {"new_log": ("新通联日志", self.on_new_log_clicked), "log_management": ("日志管理", self.on_log_manage_clicked), "import_adif": ("导入ADIF", self.on_import_clicked), "hardware_scan": ("手动输入/NFC", self.on_scan_clicked), "settings": ("设置", self.on_settings_clicked)}
+        tiles = {"new_log": ("新通联日志", self.on_new_log_clicked), "log_management": ("日志管理", self.on_log_manage_clicked), "import_adif": ("导入ADIF", self.on_import_clicked), "hardware_scan": ("手动查询", self.on_scan_clicked), "settings": ("设置", self.on_settings_clicked)}
         positions = [(0,0), (0,1), (1,0), (1,1), (2,0)]
         for position, (key, (text, func)) in zip(positions, tiles.items()):
             button = QPushButton(text); button.setObjectName("tileButton")
@@ -1132,13 +986,19 @@ class DatabaseManager:
     def get_log_details(self, log_id): return self.fetch_one("SELECT * FROM logs WHERE id = ?", (log_id,))
     def get_qsl_cards_for_log(self, log_id): return self.fetch_all("SELECT q.* FROM qsl_cards q JOIN qsl_log_link ql ON q.qsl_id = ql.qsl_id WHERE ql.log_id = ?", (log_id,))
     def get_logs_for_qsl_card(self, qsl_id): return self.fetch_all("SELECT log_id FROM qsl_log_link WHERE qsl_id = ?", (qsl_id,))
+    def get_logs_for_qsl_id_prefix(self, qsl_id_prefix):
+        return self.fetch_all("SELECT DISTINCT qsl_id FROM qsl_cards WHERE UPPER(qsl_id) LIKE ?", (f"{qsl_id_prefix.upper()}%",))
+
     def get_total_log_count(self): return self.fetch_one("SELECT COUNT(id) FROM logs")[0]
     def get_qsl_count(self, direction): return self.fetch_one("SELECT COUNT(qsl_id) FROM qsl_cards WHERE direction = ?", (direction,))[0]
     def get_recent_qsl_activity(self, limit=10): return self.fetch_all("SELECT q.direction, l.station_callsign FROM qsl_cards q JOIN qsl_log_link ql ON q.qsl_id = ql.qsl_id JOIN logs l ON ql.log_id = l.id GROUP BY q.qsl_id ORDER BY q.created_at DESC LIMIT ?", (limit,))
     def search_logs(self, station_callsign=None, my_callsign=None, mode=None, qsl_id=None):
         params = []; db_columns = ["l.id", "l.my_callsign", "l.station_callsign", "l.qso_date", "l.time_on", "l.band", "l.band_rx", "l.freq", "l.freq_rx", "l.mode", "l.qsl_sent", "l.qsl_rcvd", "l.comment"]
         col_string = ", ".join(db_columns); base_query = f"SELECT DISTINCT {col_string} FROM logs l"; joins = ""; conditions = " WHERE 1=1"
-        if qsl_id and qsl_id.strip(): joins += " JOIN qsl_log_link ql ON l.id = ql.log_id JOIN qsl_cards q ON ql.qsl_id = q.qsl_id"; conditions += " AND q.qsl_id LIKE ?"; params.append(f"%{qsl_id.strip()}%")
+        if qsl_id and qsl_id.strip(): 
+            joins += " JOIN qsl_log_link ql ON l.id = ql.log_id JOIN qsl_cards q ON ql.qsl_id = q.qsl_id"
+            conditions += " AND UPPER(q.qsl_id) LIKE ?"
+            params.append(f"{qsl_id.strip().upper()}%")
         if my_callsign and my_callsign.strip(): conditions += " AND l.my_callsign LIKE ?"; params.append(f"%{my_callsign.strip()}%")
         if station_callsign and station_callsign.strip(): conditions += " AND l.station_callsign LIKE ?"; params.append(f"%{station_callsign.strip()}%")
         if mode and mode != "全部模式": conditions += " AND l.mode = ?"; params.append(mode)
@@ -1190,12 +1050,20 @@ class DatabaseManager:
         return duplicate_sets
     def initialize_database(self):
         queries = ["CREATE TABLE IF NOT EXISTS callsigns (callsign TEXT PRIMARY KEY)", "CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY, sort_id INTEGER, my_callsign TEXT, station_callsign TEXT, qso_date TEXT, time_on TEXT, band TEXT, band_rx TEXT, freq REAL, freq_rx REAL, mode TEXT, submode TEXT, rst_sent TEXT, rst_rcvd TEXT, comment TEXT, adif_blob TEXT, qsl_sent TEXT DEFAULT 'N', qsl_rcvd TEXT DEFAULT 'N', sat_name TEXT, prop_mode TEXT)", "CREATE TABLE IF NOT EXISTS qsl_cards (qsl_id TEXT PRIMARY KEY, direction TEXT NOT NULL, status TEXT, location TEXT, created_at TEXT NOT NULL)", "CREATE TABLE IF NOT EXISTS qsl_log_link (qsl_id TEXT NOT NULL, log_id INTEGER NOT NULL, PRIMARY KEY (qsl_id, log_id), FOREIGN KEY (qsl_id) REFERENCES qsl_cards (qsl_id) ON DELETE CASCADE, FOREIGN KEY (log_id) REFERENCES logs (id) ON DELETE CASCADE)"]
-        for query in queries: self.execute_query(query)
+        try:
+            for query in queries:
+                self.cursor.execute(query)
+            self.conn.commit()
+        except sqlite3.Error as e:
+            print(f"Database initialization error: {e}")
+            self.conn.rollback()
+
         try:
             self.cursor.execute("SELECT sort_id FROM logs LIMIT 1")
         except sqlite3.OperationalError:
             self.execute_query("ALTER TABLE logs ADD COLUMN sort_id INTEGER")
             self.execute_query("UPDATE logs SET sort_id = id")
+            
     def reorder_logs_by_time(self):
         try:
             logs = self.fetch_all("SELECT id, qso_date, time_on FROM logs ORDER BY qso_date, time_on")
@@ -1214,7 +1082,7 @@ class DatabaseManager:
         qsl_id = qsl_id_row['qsl_id']
         status_field = "qsl_rcvd" if direction == 'RC' else "qsl_sent"
         self.execute_query(f"UPDATE logs SET {status_field} = 'N' WHERE id = ?", (log_id,))
-        self.execute_query("DELETE FROM qsl_log_link WHERE qsl_id = ? AND log_id = ?", (qsl_id,))
+        self.execute_query("DELETE FROM qsl_log_link WHERE qsl_id = ? AND log_id = ?", (qsl_id, log_id))
         is_linked_elsewhere = self.fetch_one("SELECT 1 FROM qsl_log_link WHERE qsl_id = ?", (qsl_id,))
         if not is_linked_elsewhere: self.execute_query("DELETE FROM qsl_cards WHERE qsl_id = ?", (qsl_id,))
         return True
@@ -1249,10 +1117,6 @@ if __name__ == '__main__':
     missing_libs = []
     try: import adif_io
     except ImportError: missing_libs.append('adif-io')
-    try: import serial
-    except ImportError: missing_libs.append('pyserial')
-    try: import nfc
-    except ImportError: missing_libs.append('nfcpy')
     try: import qrcode
     except ImportError: missing_libs.append('qrcode')
     try: from reportlab.pdfgen import canvas
