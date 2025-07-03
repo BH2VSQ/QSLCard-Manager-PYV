@@ -6,33 +6,45 @@ import secrets
 import json
 import threading
 import socket
+import re
 from io import BytesIO
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QGridLayout, 
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QGridLayout,
                              QPushButton, QLabel, QVBoxLayout, QFrame,
                              QStackedWidget, QMessageBox, QTableView, QHeaderView,
                              QLineEdit, QDateEdit, QComboBox, QHBoxLayout,
                              QFormLayout, QDialog, QDialogButtonBox, QTextEdit,
                              QListWidget, QInputDialog, QFileDialog, QListWidgetItem,
-                             QTextBrowser, QGroupBox)
-from PyQt5.QtCore import Qt, QSize, pyqtSignal, QAbstractTableModel, QDate, QTime, QDateTime, QThread, QRectF, QSizeF
+                             QTextBrowser, QGroupBox, QCheckBox)
+from PyQt5.QtCore import Qt, QSize, pyqtSignal, QAbstractTableModel, QDate, QTime, QDateTime, QThread, QRectF, QSizeF, QPointF
 from PyQt5.QtGui import QIcon, QFont, QImage, QPixmap, QPainter, QColor
-from PyQt5.QtPrintSupport import QPrinter, QPrintDialog
 
 # --- Third-party library dependency check (will be handled in main) ---
 try:
     import adif_io
     import qrcode
     from reportlab.pdfgen import canvas
-    from reportlab.lib.pagesizes import mm
+    from reportlab.lib.pagesizes import mm, landscape, portrait
     from reportlab.lib.utils import ImageReader
-    from reportlab.graphics.barcode import code128
-    from reportlab.graphics.shapes import Drawing
-    from reportlab.graphics import renderPDF
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
     from PIL import Image
     from PIL.ImageQt import ImageQt
     import fitz # PyMuPDF
+    import serial
+    import serial.tools.list_ports
 except ImportError:
     pass
+
+# --- Helper function for PyInstaller resource path ---
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
 
 # --- Constants ---
 DB_FILE = "database/qsl_manager.db"
@@ -40,29 +52,47 @@ LOGBOOK_FILE = "logbook.adi"
 STYLE_SHEET_FILE = "assets/style.qss"
 CONFIG_FILE = "config.json"
 LABELS_DIR = "labels"
-MODES_LIST = ["", "AM", "ARDOP", "ATV", "C4FM", "CHIP", "CLO", "CW", "DIGITALVOICE", "DOMINO", "DSTAR", "FAX", "FM", "FSK441", "FT8", "FT4", "HELL", "JT4", "JT6M", "JT9", "JT44", "JT65", "MFSK", "MSK144", "MT63", "OLIVIA", "OPERA", "PACKET", "PAX", "PSK", "PSK2K", "Q15", "QRA64", "ROS", "RTTY", "RTTYM", "SSB", "SSTV", "THOR", "THRB", "V4", "V5", "VOI", "WINMOR", "WSPR", "AMSS", "ASCI", "PCW", "EYEBALL"]
+ENG_FONT_FILE = "MapleMonoNL-Regular.ttf" # English Font
+ZH_FONT_FILE = "Cinese.ttf"              # Chinese Font
+MODES_LIST = ["", "AM", "ARDOP", "ATV", "C4FM", "CHIP", "CLO", "CW", "DIGITALVOICE", "DOMINO", "DSTAR", "FAX", "FM", "FSK441", "FT8", "FT4", "HELL", "JT4", "JT6M", "JT9", "JT44", "JT65", "MFSK", "MSK144", "MT63", "OLIVIA", "OPERA", "PKT", "PAX", "PSK", "PSK2K", "Q15", "QRA64", "ROS", "RTTY", "RTTYM", "SSB", "SSTV", "THOR", "THRB", "V4", "V5", "VOI", "WINMOR", "WSPR", "AMSS", "ASCI", "PCW", "EYEBALL"]
 FREQ_BAND_MAP = {
     (1.8, 2.0): "160m", (3.5, 4.0): "80m", (5.0, 5.6): "60m", (7.0, 7.3): "40m",
     (10.1, 10.15): "30m", (14.0, 14.35): "20m", (18.068, 18.168): "17m",
     (21.0, 21.45): "15m", (24.89, 24.99): "12m", (28.0, 29.7): "10m",
     (50, 54): "6m", (144, 148): "2m", (222, 225): "1.25m", (420, 450): "70cm",
-    (902, 928): "33cm", (1240, 1300): "23cm"
+    (902, 928): "33cm", (1240, 1300): "23cm",
+    (2300, 2450): "13cm",
+    (3400, 3500): "9cm",
+    (5650, 5850): "5cm",
+    (10000, 10500): "3cm",
+    (24000, 24250): "1.2cm",
+    (47000, 47200): "6mm",
+    (76000, 81000): "4mm", # Merged 76-77.5, 77.5-78, 78-81
+    (122250, 123000): "2.5mm",
+    (134000, 136000): "2mm",
+    (241000, 250000): "1mm" # Merged 241-248, 248-250
 }
+
 
 # --- Configuration Manager ---
 class ConfigManager:
     @staticmethod
     def load_config():
-        default_config = {"primary_callsign": ""}
+        default_config = {"primary_callsign": "", "nfc_port": "", "nfc_baudrate": 9600}
         if not os.path.exists(CONFIG_FILE): return default_config
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                config = json.load(f)
+                # Ensure default keys exist
+                for key, value in default_config.items():
+                    config.setdefault(key, value)
+                return config
         except (IOError, json.JSONDecodeError): return default_config
 
     @staticmethod
     def save_config(config_data):
         try:
+            os.makedirs(os.path.dirname(CONFIG_FILE) or '.', exist_ok=True)
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f: json.dump(config_data, f, indent=4)
         except IOError as e: print(f"Error saving config: {e}")
 
@@ -94,122 +124,365 @@ class ADIF_Handler:
             with open(LOGBOOK_FILE, "a", encoding="utf-8") as f: f.write(adif_record)
         except IOError as e: print(f"Error writing to logbook file: {e}")
 
-# --- Label Printer ---
-class LabelPrinter:
+# --- New Fixed Layout Printer (Updated for Mixed Fonts) ---
+class NewLayoutPrinter:
+    _eng_font = 'Helvetica'
+    _zh_font = 'STSong-Light' # Default
+    _fonts_registered = False
+
     @staticmethod
-    def generate_label(qsl_id, log_data_list, parent_widget, output_mode="print"):
+    def _setup_fonts():
+        if NewLayoutPrinter._fonts_registered:
+            return (NewLayoutPrinter._eng_font, NewLayoutPrinter._zh_font)
+
+        eng_font_path = resource_path(ENG_FONT_FILE)
+        zh_font_path = resource_path(ZH_FONT_FILE)
+
+        # Setup English Font
+        if os.path.exists(eng_font_path):
+            try:
+                pdfmetrics.registerFont(TTFont('MapleMono', eng_font_path))
+                NewLayoutPrinter._eng_font = 'MapleMono'
+                print(f"字体 '{ENG_FONT_FILE}' 已成功注册为 'MapleMono'。")
+            except Exception as e:
+                print(f"注册字体 '{ENG_FONT_FILE}' 时出错: {e}。退回使用 Helvetica。")
+        else:
+            print(f"警告: 未找到英文字体文件 '{ENG_FONT_FILE}'。英文将使用 Helvetica。")
+        
+        # Setup Chinese Font
+        if os.path.exists(zh_font_path):
+            try:
+                pdfmetrics.registerFont(TTFont('CineseFont', zh_font_path))
+                NewLayoutPrinter._zh_font = 'CineseFont'
+                print(f"字体 '{ZH_FONT_FILE}' 已成功注册为 'CineseFont'。")
+            except Exception as e:
+                print(f"注册字体 '{ZH_FONT_FILE}' 时出错: {e}。退回使用 STSong-Light。")
+                NewLayoutPrinter._zh_font = 'STSong-Light'
+        else:
+            print(f"警告: 未找到中文字体文件 '{ZH_FONT_FILE}'。中文将使用内置的 STSong-Light。")
+            NewLayoutPrinter._zh_font = 'STSong-Light'
+
+        NewLayoutPrinter._fonts_registered = True
+        return (NewLayoutPrinter._eng_font, NewLayoutPrinter._zh_font)
+
+    @staticmethod
+    def _draw_mixed_string(c, x, y, text, fonts, size):
+        eng_font, zh_font = fonts
+        cursor_x = x
+        segments = re.findall(r'([\u4e00-\u9fff]+|[^\u4e00-\u9fff]+)', text)
+        
+        for segment in segments:
+            is_chinese = '\u4e00' <= segment[0] <= '\u9fff'
+            font_to_use = zh_font if is_chinese else eng_font
+            c.setFont(font_to_use, size)
+            
+            c.drawString(cursor_x, y, segment)
+            cursor_x += c.stringWidth(segment, font_to_use, size)
+
+    @staticmethod
+    def _draw_mixed_centred_string(c, x, y, text, fonts, size):
+        eng_font, zh_font = fonts
+        
+        total_width = 0
+        segments = re.findall(r'([\u4e00-\u9fff]+|[^\u4e00-\u9fff]+)', text)
+        for segment in segments:
+            is_chinese = '\u4e00' <= segment[0] <= '\u9fff'
+            font_to_use = zh_font if is_chinese else eng_font
+            total_width += pdfmetrics.stringWidth(segment, font_to_use, size)
+            
+        start_x = x - (total_width / 2)
+        NewLayoutPrinter._draw_mixed_string(c, start_x, y, text, fonts, size)
+
+    @staticmethod
+    def _render_and_output_as_png(qsl_id, pdf_buffer, parent_widget):
+        output_dir = os.path.join(LABELS_DIR, qsl_id)
+        os.makedirs(output_dir, exist_ok=True)
+        pdf_buffer.seek(0)
+        try:
+            doc = fitz.open("pdf", pdf_buffer.read())
+            zoom_matrix = fitz.Matrix(10, 10)
+            if len(doc) > 0:
+                page1 = doc.load_page(0)
+                pix1 = page1.get_pixmap(matrix=zoom_matrix, alpha=True)
+                pix1.save(os.path.join(output_dir, "QSL.png"))
+            if len(doc) > 1:
+                page2 = doc.load_page(1)
+                pix2 = page2.get_pixmap(matrix=zoom_matrix, alpha=True)
+                pix2.save(os.path.join(output_dir, "Address_Label.png"))
+            doc.close()
+            QMessageBox.information(parent_widget, "导出成功", f"标签已导出为PNG图片，保存在:\n{output_dir}")
+        except Exception as e:
+             QMessageBox.critical(parent_widget, "导出失败", f"导出PNG时发生错误: {e}")
+            
+    @staticmethod
+    def generate_layout_1(qsl_id, log_data_list, parent_widget):
         os.makedirs(LABELS_DIR, exist_ok=True)
         pdf_buffer = BytesIO()
         try:
-            # Create PDF in memory
-            page_width, page_height = 40 * mm, 25 * mm
+            fonts = NewLayoutPrinter._setup_fonts()
+            page_width, page_height = (140*mm, 90*mm)
             c = canvas.Canvas(pdf_buffer, pagesize=(page_width, page_height))
-            margin = 2 * mm
+            
+            logs_per_page = 5
+            log_chunks = [log_data_list[i:i + logs_per_page] for i in range(0, len(log_data_list), logs_per_page)]
 
-            # --- Page 1 ---
-            c.setFont("Helvetica", 7)
-            log_dict = dict(log_data_list[0])
-            c.drawString(margin, 22*mm, f"To: {log_dict.get('station_callsign', '')}")
-            c.drawString(margin, 19*mm, f"Fm: {log_dict.get('my_callsign', '')}")
-            textobject = c.beginText(margin, 16*mm)
-            textobject.setFont("Helvetica", 6)
-            textobject.setLeading(7) # Line spacing
-            
-            if len(log_data_list) == 1:
-                log = log_dict
-                textobject.textLine(f"Date: {log.get('qso_date', '')} {log.get('time_on', '')}Z")
-                textobject.textLine(f"Band: {log.get('band', '')} Mode: {log.get('mode', '')} RST: {log.get('rst_rcvd', '')}")
-                if log.get('sat_name'):
-                    textobject.textLine(f"SAT: {log.get('sat_name')}")
-            else:
-                textobject.textLine(f"Multiple QSOs ({len(log_data_list)}):")
-                for i, log_row in enumerate(log_data_list[:3]):
+            for page_num, chunk in enumerate(log_chunks):
+                y_pos_header = page_height - 20
+                NewLayoutPrinter._draw_mixed_string(c, 25, y_pos_header, "To Radio", fonts, 7)
+                NewLayoutPrinter._draw_mixed_string(c, 100, y_pos_header, "Date", fonts, 7)
+                NewLayoutPrinter._draw_mixed_string(c, 200, y_pos_header, "UTC", fonts, 7)
+                NewLayoutPrinter._draw_mixed_string(c, 240, y_pos_header, "UrSigs", fonts, 7)
+                NewLayoutPrinter._draw_mixed_string(c, 280, y_pos_header, "MHz", fonts, 7)
+                NewLayoutPrinter._draw_mixed_string(c, 340, y_pos_header, "2Way", fonts, 7)
+                c.line(20, y_pos_header - 5, page_width - 20, y_pos_header - 5)
+
+                y_pos_current = y_pos_header - 15
+                line_height = 11
+                entry_spacing = 16 
+
+                for i, log_row in enumerate(chunk):
                     log = dict(log_row)
-                    textobject.textLine(f"-{log.get('qso_date','')} {log.get('band','')} {log.get('mode','')}")
-                if len(log_data_list) > 3: textobject.textLine("...")
-            c.drawText(textobject)
+                    
+                    date_str = log.get('qso_date')
+                    try:
+                        formatted_date = datetime.datetime.strptime(date_str, '%Y%m%d').strftime('%b.%d, %Y')
+                    except (ValueError, TypeError):
+                        formatted_date = str(date_str or '')
+                    
+                    station_callsign = str(log.get('station_callsign') or '')
+                    time_on = str(log.get('time_on') or '')
+                    rst_rcvd = str(log.get('rst_rcvd') or '')
+                    mode = str(log.get('mode') or '')
+
+                    NewLayoutPrinter._draw_mixed_string(c, 25, y_pos_current, station_callsign, fonts, 9)
+                    NewLayoutPrinter._draw_mixed_string(c, 100, y_pos_current, formatted_date, fonts, 9)
+                    NewLayoutPrinter._draw_mixed_string(c, 200, y_pos_current, time_on, fonts, 9)
+                    NewLayoutPrinter._draw_mixed_string(c, 240, y_pos_current, rst_rcvd, fonts, 9)
+                    NewLayoutPrinter._draw_mixed_string(c, 340, y_pos_current, mode, fonts, 9)
+                    
+                    if log.get('sat_name'):
+                        freq_rx = float(log.get('freq_rx') or 0)
+                        freq_tx = float(log.get('freq') or 0)
+                        if 400 < freq_rx < 500 and 140 < freq_tx < 150: freq_display = "145/435"
+                        elif 140 < freq_rx < 150 and 400 < freq_tx < 500: freq_display = "435/145"
+                        elif 400 < freq_rx < 500 and 400 < freq_tx < 500: freq_display = "435/435"
+                        elif 140 < freq_rx < 150 and 140 < freq_tx < 150: freq_display = "145/145"
+                        else: freq_display = f"{str(log.get('freq') or '')}/{str(log.get('freq_rx') or '')}"
+                        NewLayoutPrinter._draw_mixed_string(c, 280, y_pos_current, freq_display, fonts, 9)
+                    elif log.get('mode') == 'EYEBALL':
+                        NewLayoutPrinter._draw_mixed_string(c, 280, y_pos_current, "N/A", fonts, 9)
+                    else:
+                        NewLayoutPrinter._draw_mixed_string(c, 280, y_pos_current, str(log.get('freq') or ''), fonts, 9)
+
+                    y_pos_current -= line_height
+
+                    if log.get('sat_name'):
+                        NewLayoutPrinter._draw_mixed_string(c, 100, y_pos_current, f"Satellite: via {log.get('sat_name')}", fonts, 9)
+                    elif log.get('mode') == 'EYEBALL':
+                        NewLayoutPrinter._draw_mixed_string(c, 100, y_pos_current, f"Type: {str(log.get('submode') or '')}", fonts, 9)
+                    
+                    comment = str(log.get('comment') or '')
+                    if comment:
+                        NewLayoutPrinter._draw_mixed_string(c, 250, y_pos_current, f"备注: {comment[:25]}", fonts, 9)
+                    
+                    y_pos_current -= entry_spacing
+
+                NewLayoutPrinter._draw_mixed_centred_string(c, page_width / 8 * 5, 15, "PSE  QSL  TNX", fonts, 9)
+
+                qr_img = qrcode.make(qsl_id)
+                qr_buffer = BytesIO()
+                qr_img.save(qr_buffer, "PNG")
+                qr_buffer.seek(0)
+                c.drawImage(ImageReader(qr_buffer), page_width - 90, 20, width=70, height=70, preserveAspectRatio=True)
+
+                if page_num < len(log_chunks) - 1:
+                    c.showPage()
+
+            c.showPage()
+            NewLayoutPrinter._draw_mixed_centred_string(c, page_width / 2, page_height - 50, qsl_id, fonts, 12)
+            qr_img_page2 = qrcode.make(qsl_id)
+            qr_buffer_page2 = BytesIO()
+            qr_img_page2.save(qr_buffer_page2, "PNG")
+            qr_buffer_page2.seek(0)
+            c.drawImage(ImageReader(qr_buffer_page2), (page_width - 100)/2, (page_height-150)/2, width=100, height=100, preserveAspectRatio=True)
+            c.save()
+
+            NewLayoutPrinter._render_and_output_as_png(qsl_id, pdf_buffer, parent_widget)
+        except Exception as e:
+            QMessageBox.critical(None, "操作失败", f"生成版式1时出错: {e}")
+
+
+    @staticmethod
+    def generate_layout_2(qsl_id, log_data_list, parent_widget):
+        os.makedirs(LABELS_DIR, exist_ok=True)
+        pdf_buffer = BytesIO()
+        try:
+            fonts = NewLayoutPrinter._setup_fonts()
+            page_width, page_height = (160*mm, 90*mm)
+            c = canvas.Canvas(pdf_buffer, pagesize=(page_width, page_height))
             
+            log = dict(log_data_list[0]) if log_data_list else {}
+            
+            date_str = log.get('qso_date')
+            to_radio = str(log.get('station_callsign') or '')
+            day, month, year = "DD", "MM", "YYYY"
+            if date_str:
+                try:
+                    dt_obj = datetime.datetime.strptime(date_str, '%Y%m%d')
+                    day, month, year = dt_obj.strftime('%d'), dt_obj.strftime('%m'), dt_obj.strftime('%Y')
+                except (ValueError, TypeError):
+                    pass
+            
+            NewLayoutPrinter._draw_mixed_string(c, page_width * 0.75, page_height * 0.90, to_radio, fonts, 24)
+            
+            NewLayoutPrinter._draw_mixed_centred_string(c, page_width * 0.10, page_height * 0.55, day, fonts, 14)
+            NewLayoutPrinter._draw_mixed_centred_string(c, page_width * 0.16, page_height * 0.55, month, fonts, 14)
+            NewLayoutPrinter._draw_mixed_centred_string(c, page_width * 0.25, page_height * 0.55, year, fonts, 14)
+            NewLayoutPrinter._draw_mixed_centred_string(c, page_width * 0.36, page_height * 0.55, str(log.get('time_on', '0000')), fonts, 14)
+            NewLayoutPrinter._draw_mixed_centred_string(c, page_width * 0.65, page_height * 0.55, str(log.get('freq', '')), fonts, 14)
+            NewLayoutPrinter._draw_mixed_centred_string(c, page_width * 0.80, page_height * 0.55, str(log.get('mode', '')), fonts, 14)
+            NewLayoutPrinter._draw_mixed_centred_string(c, page_width * 0.95, page_height * 0.55, str(log.get('rst_rcvd', '')), fonts, 14)
+
             qr_img = qrcode.make(qsl_id)
             qr_buffer = BytesIO()
             qr_img.save(qr_buffer, "PNG")
             qr_buffer.seek(0)
-            c.drawImage(ImageReader(qr_buffer), 15*mm, 2*mm, width=10*mm, height=10*mm, preserveAspectRatio=True)
-            
+            c.drawImage(ImageReader(qr_buffer), page_width * 0.65, page_height * 0.05, width=70, height=70, preserveAspectRatio=True)
+
             c.showPage()
-
-            # --- Page 2 ---
-            c.setFont("Helvetica-Bold", 7)
-            c.drawCentredString(page_width / 2, 22*mm, qsl_id)
             
-            # QR Code (Center)
+            NewLayoutPrinter._draw_mixed_centred_string(c, page_width / 2, page_height - 50, qsl_id, fonts, 12)
             qr_buffer.seek(0)
-            qr_size = 12*mm # Slightly larger QR code
-            c.drawImage(ImageReader(qr_buffer), (page_width - qr_size)/2, (page_height - qr_size)/2, width=qr_size, height=qr_size, preserveAspectRatio=True)
-
+            c.drawImage(ImageReader(qr_buffer), (page_width - 100)/2, (page_height-150)/2, width=100, height=100, preserveAspectRatio=True)
             c.save()
 
-            # --- Output based on mode ---
-            if output_mode == "print":
-                pdf_path = os.path.join(LABELS_DIR, f"{qsl_id}.pdf")
-                with open(pdf_path, "wb") as f:
-                    f.write(pdf_buffer.getvalue())
-
-                if sys.platform == "win32":
-                    os.startfile(pdf_path, "print")
-                else:
-                    os.system(f"lp {pdf_path}")
-                QMessageBox.information(parent_widget, "打印任务", f"已生成标签 {pdf_path} 并发送到打印机。")
-
-            elif output_mode == "png":
-                output_dir = os.path.join(LABELS_DIR, qsl_id)
-                os.makedirs(output_dir, exist_ok=True)
-                pdf_buffer.seek(0)
-                
-                doc = fitz.open("pdf", pdf_buffer.read())
-                zoom_matrix = fitz.Matrix(10, 10)
-                
-                if len(doc) > 0:
-                    page1 = doc.load_page(0)
-                    pix1 = page1.get_pixmap(matrix=zoom_matrix)
-                    pix1.save(os.path.join(output_dir, "QSL.png"))
-
-                if len(doc) > 1:
-                    page2 = doc.load_page(1)
-                    pix2 = page2.get_pixmap(matrix=zoom_matrix)
-                    pix2.save(os.path.join(output_dir, "Letter.png"))
-                    
-                doc.close()
-                QMessageBox.information(parent_widget, "导出成功", f"标签已导出为PNG图片，保存在:\n{output_dir}")
-
+            NewLayoutPrinter._render_and_output_as_png(qsl_id, pdf_buffer, parent_widget)
         except Exception as e:
-            QMessageBox.critical(None, "操作失败", f"生成或输出标签时出错: {e}")
-            
+            QMessageBox.critical(None, "操作失败", f"生成版式2时出错: {e}")
+
+# --- NFC Writer Class ---
+class NFCWriter:
+    @staticmethod
+    def get_available_ports():
+        """Returns a list of available serial ports."""
+        ports = serial.tools.list_ports.comports()
+        return [port.device for port in ports]
+
+    @staticmethod
+    def write_to_port(port, baudrate, data, parent):
+        """Tries to write data to the specified serial port with a newline character."""
+        try:
+            with serial.Serial(port, baudrate, timeout=1) as ser:
+                # Append a newline character to simulate pressing Enter
+                ser.write((data + '\n').encode('utf-8'))
+                QMessageBox.information(parent, "成功", f"已成功将数据 '{data}' (并附加回车) 发送到端口 {port}。")
+                return True
+        except serial.SerialException as e:
+            QMessageBox.critical(parent, "写入失败", f"无法打开或写入串口 {port}。\n错误: {e}")
+            return False
+
 # --- Dialogs ---
-class OutputModeDialog(QDialog):
+class NfcWriteDialog(QDialog):
+    """Dialog for writing a QSL ID to an NFC card via serial port."""
+    def __init__(self, qsl_id, parent=None):
+        super().__init__(parent)
+        self.qsl_id = qsl_id
+        self.setWindowTitle("写入NFC卡")
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        self.setMinimumWidth(400)
+
+        layout = QFormLayout(self)
+        
+        self.qsl_id_label = QLabel(self.qsl_id)
+        self.qsl_id_label.setStyleSheet("font-weight: bold; color: #f1c40f;")
+        
+        self.port_combo = QComboBox()
+        self.baudrate_combo = QComboBox()
+        self.baudrate_combo.addItems(['9600', '19200', '38400', '57600', '115200'])
+        
+        self.refresh_button = QPushButton("刷新端口")
+        self.refresh_button.clicked.connect(self.populate_ports)
+        
+        port_layout = QHBoxLayout()
+        port_layout.addWidget(self.port_combo, 1)
+        port_layout.addWidget(self.refresh_button)
+
+        layout.addRow("QSL卡号:", self.qsl_id_label)
+        layout.addRow("串口:", port_layout)
+        layout.addRow("波特率:", self.baudrate_combo)
+        
+        self.button_box = QDialogButtonBox()
+        self.write_button = self.button_box.addButton("写入", QDialogButtonBox.AcceptRole)
+        self.button_box.addButton(QDialogButtonBox.Cancel)
+        
+        layout.addRow(self.button_box)
+
+        self.write_button.clicked.connect(self.perform_write)
+        self.button_box.rejected.connect(self.reject)
+        
+        self.populate_ports()
+        self.load_saved_settings()
+        
+    def populate_ports(self):
+        self.port_combo.clear()
+        ports = NFCWriter.get_available_ports()
+        if not ports:
+            self.port_combo.addItem("未找到串口")
+            self.write_button.setEnabled(False)
+        else:
+            self.port_combo.addItems(ports)
+            self.write_button.setEnabled(True)
+
+    def load_saved_settings(self):
+        saved_port = ConfigManager.get_config("nfc_port")
+        saved_baudrate = str(ConfigManager.get_config("nfc_baudrate", 9600))
+        
+        if saved_port and self.port_combo.findText(saved_port) != -1:
+            self.port_combo.setCurrentText(saved_port)
+            
+        if saved_baudrate and self.baudrate_combo.findText(saved_baudrate) != -1:
+            self.baudrate_combo.setCurrentText(saved_baudrate)
+
+    def perform_write(self):
+        port = self.port_combo.currentText()
+        baudrate = int(self.baudrate_combo.currentText())
+        
+        if port == "未找到串口":
+            QMessageBox.warning(self, "无端口", "请先连接串口设备并刷新端口列表。")
+            return
+            
+        ConfigManager.set_config("nfc_port", port)
+        ConfigManager.set_config("nfc_baudrate", baudrate)
+
+        if NFCWriter.write_to_port(port, baudrate, self.qsl_id, self):
+            self.accept()
+
+class PrintLayoutDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("选择输出模式")
+        self.setWindowTitle("选择打印版式")
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
-        self.setFixedSize(350, 120)
-        self.mode = None
+        self.setFixedSize(350, 150)
+        self.layout_choice = None
+        
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("请选择标签的输出方式："))
-        
-        self.print_button = QPushButton("直接打印")
-        self.png_button = QPushButton("导出为PNG图片")
-        
-        self.print_button.clicked.connect(self.select_print)
-        self.png_button.clicked.connect(self.select_png)
-        
-        layout.addWidget(self.print_button)
-        layout.addWidget(self.png_button)
+        layout.addWidget(QLabel("请选择要使用的打印版式："))
 
-    def select_print(self):
-        self.mode = "print"
+        self.layout1_button = QPushButton("版式 1 (信息列表式)")
+        self.layout2_button = QPushButton("版式 2 (表格填充式)")
+        
+        self.layout1_button.clicked.connect(self.select_layout1)
+        self.layout2_button.clicked.connect(self.select_layout2)
+
+        layout.addWidget(self.layout1_button)
+        layout.addWidget(self.layout2_button)
+
+    def select_layout1(self):
+        self.layout_choice = 1
         self.accept()
 
-    def select_png(self):
-        self.mode = "png"
+    def select_layout2(self):
+        self.layout_choice = 2
         self.accept()
 
 class BatchQslModeDialog(QDialog):
@@ -243,7 +516,7 @@ class CardActionDialog(QDialog):
         self.rc_button = QPushButton(f"收卡 (RC): {rc_card['qsl_id'] if rc_card else '无'}")
         self.rc_button.setEnabled(rc_card is not None)
         self.rc_button.clicked.connect(lambda: self.select_card(rc_card))
-        
+
         self.tc_button = QPushButton(f"发卡 (TC): {tc_card['qsl_id'] if tc_card else '无'}")
         self.tc_button.setEnabled(tc_card is not None)
         self.tc_button.clicked.connect(lambda: self.select_card(tc_card))
@@ -260,34 +533,51 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.db_manager = db_manager; self.setWindowTitle("设置")
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
-        self.setFixedSize(1000, 1000)
+        self.setMinimumSize(1000, 600)
         main_layout = QVBoxLayout(self)
-        callsign_frame = QFrame(); callsign_frame.setFrameShape(QFrame.StyledPanel); layout = QVBoxLayout(callsign_frame)
-        self.callsign_list = QListWidget(); layout.addWidget(QLabel("我的呼号管理:")); layout.addWidget(self.callsign_list)
-        btn_layout = QHBoxLayout(); self.add_btn = QPushButton("添加新呼号"); self.del_btn = QPushButton("删除选中呼号"); self.set_primary_btn = QPushButton("设为主要呼号")
-        btn_layout.addWidget(self.add_btn); btn_layout.addWidget(self.del_btn); btn_layout.addWidget(self.set_primary_btn); layout.addLayout(btn_layout)
         
+        # Callsign Settings
+        callsign_frame = QGroupBox("呼号管理"); callsign_layout = QVBoxLayout(callsign_frame)
+        self.callsign_list = QListWidget()
+        callsign_layout.addWidget(self.callsign_list)
+        btn_layout = QHBoxLayout(); self.add_btn = QPushButton("添加新呼号"); self.del_btn = QPushButton("删除选中呼号"); self.set_primary_btn = QPushButton("设为主要呼号")
+        btn_layout.addWidget(self.add_btn); btn_layout.addWidget(self.del_btn); btn_layout.addWidget(self.set_primary_btn)
+        callsign_layout.addLayout(btn_layout)
+        main_layout.addWidget(callsign_frame)
+
+        # Danger Zone
         danger_zone = QGroupBox("危险区域"); danger_layout = QVBoxLayout(danger_zone)
         self.reset_data_btn = QPushButton("重置全部卡片数据"); self.reset_data_btn.setStyleSheet("background-color: #c0392b;")
         danger_layout.addWidget(self.reset_data_btn)
+        main_layout.addWidget(danger_zone)
 
-        main_layout.addWidget(callsign_frame); main_layout.addWidget(danger_zone); main_layout.addStretch()
+        main_layout.addStretch()
         self.close_button = QDialogButtonBox(QDialogButtonBox.Close); main_layout.addWidget(self.close_button)
+
+        # Connections
         self.add_btn.clicked.connect(self.add_callsign); self.del_btn.clicked.connect(self.delete_callsign)
         self.set_primary_btn.clicked.connect(self.set_primary)
         self.reset_data_btn.clicked.connect(self.handle_reset_data)
-        self.close_button.rejected.connect(self.reject); self.load_settings()
+        self.close_button.rejected.connect(self.reject)
         
+        self.load_settings()
+
     def load_settings(self):
+        # Load callsign settings
         self.callsign_list.clear(); primary_callsign = ConfigManager.get_config("primary_callsign"); callsigns = self.db_manager.get_all_my_callsigns()
         for callsign in callsigns:
             self.callsign_list.addItem(callsign)
-            if callsign == primary_callsign: item = self.callsign_list.findItems(callsign, Qt.MatchExactly)[0]; item.setFont(QFont("Arial", 12, QFont.Bold)); item.setForeground(Qt.yellow)
-        
+            if callsign == primary_callsign: 
+                try:
+                    item = self.callsign_list.findItems(callsign, Qt.MatchExactly)[0]
+                    item.setFont(QFont("Arial", 12, QFont.Bold)); item.setForeground(Qt.yellow)
+                except IndexError:
+                    pass # Should not happen if callsign exists
+
     def handle_reset_data(self):
         reply = QMessageBox.question(self, "危险操作确认", "您确定要重置所有QSL卡片数据吗？\n\n此操作将 **永久删除** 所有已生成的卡号和出入库记录，并将所有日志状态重置为未收/发。\n\n**此操作不可恢复！**", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply == QMessageBox.No: return
-            
+
         password, ok = QInputDialog.getText(self, "密码确认", "请输入密码 'admin' 以确认操作:", QLineEdit.Password)
         if ok and password == "admin":
             if self.db_manager.reset_all_qsl_data():
@@ -297,7 +587,7 @@ class SettingsDialog(QDialog):
                 QMessageBox.critical(self, "操作失败", "重置数据时发生错误。")
         elif ok:
             QMessageBox.warning(self, "密码错误", "密码不正确，操作已取消。")
-            
+
     def add_callsign(self):
         text, ok = QInputDialog.getText(self, "添加呼号", "请输入您的呼号:")
         if ok and text:
@@ -316,7 +606,7 @@ class SettingsDialog(QDialog):
         current_item = self.callsign_list.currentItem()
         if not current_item: QMessageBox.warning(self, "操作提示", "请先选择一个要设为主用的呼号。"); return
         callsign = current_item.text(); ConfigManager.set_config("primary_callsign", callsign); self.load_settings(); QMessageBox.information(self, "成功", f"'{callsign}' 已被设为您的主要呼号。")
-        
+
 # --- Log Detail/Edit Dialog ---
 class LogDetailDialog(QDialog):
     def __init__(self, db_manager, my_callsign, log_id=None, parent=None):
@@ -328,14 +618,18 @@ class LogDetailDialog(QDialog):
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         self.setFixedSize(1000, 1200)
         layout = QVBoxLayout(self)
-        self.qso_type_combo = QComboBox(); self.qso_type_combo.addItems(["基础 (HF/VHF/UHF)", "卫星 (Satellite)", "中继 (Repeater)", "Eyeball"])
+        self.qso_type_combo = QComboBox(); self.qso_type_combo.addItems(["Basic (HF/VHF/UHF)", "Satellite", "Repeater", "Eyeball"])
         self.qso_type_combo.currentIndexChanged.connect(self.update_form_layout)
         type_layout = QFormLayout(); type_layout.addRow("通联类型:", self.qso_type_combo); layout.addLayout(type_layout)
         self.form_layout = QFormLayout()
         self.callsign_input = QLineEdit(); self.callsign_input.textChanged.connect(self.force_uppercase_callsign)
         self.qso_date_input = QDateEdit(); self.qso_date_input.setDisplayFormat("yyyy-MM-dd")
-        self.time_on_input = QLineEdit(); self.band_input = QComboBox(); self.band_input.addItems(["", "160m", "80m", "60m", "40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m", "4m", "2m", "1.25m", "70cm", "33cm", "23cm", "13cm", "9cm", "6cm", "3cm", "1.25cm", "N/A"])
-        self.band_rx_input = QComboBox(); self.band_rx_input.addItems(["", "160m", "80m", "60m", "40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m", "4m", "2m", "1.25m", "70cm", "33cm", "23cm", "13cm", "9cm", "6cm", "3cm", "1.25cm", "N/A"])
+        self.time_on_input = QLineEdit()
+        
+        band_list = ["", "160m", "80m", "60m", "40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m", "2m", "1.25m", "70cm", "33cm", "23cm", "13cm", "9cm", "5cm", "3cm", "1.2cm", "6mm", "4mm", "2.5mm", "2mm", "1mm", "N/A"]
+        self.band_input = QComboBox(); self.band_input.addItems(band_list)
+        self.band_rx_input = QComboBox(); self.band_rx_input.addItems(band_list)
+        
         self.freq_input = QLineEdit(); self.freq_input.editingFinished.connect(self.update_band_from_freq)
         self.freq_rx_input = QLineEdit();
         self.mode_input = QComboBox(); self.mode_input.addItems(MODES_LIST)
@@ -355,51 +649,65 @@ class LogDetailDialog(QDialog):
             qsl_layout.addRow("收卡 (RC) 编号:", self.rc_card_label); qsl_layout.addRow("发卡 (TC) 编号:", self.tc_card_label); layout.addWidget(qsl_frame)
         self.buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         self.buttons.accepted.connect(self.accept); self.buttons.rejected.connect(self.reject); layout.addWidget(self.buttons); self.populate_data()
-    
+
     def force_uppercase_callsign(self, text):
         self.callsign_input.setText(text.upper())
 
     def update_band_from_freq(self):
         try:
-            freq_mhz = float(self.freq_input.text())
+            freq_text = self.freq_input.text().lower()
+            freq_mhz = 0
+            if 'g' in freq_text:
+                freq_mhz = float(freq_text.replace('g','').strip()) * 1000
+            else:
+                freq_mhz = float(freq_text)
+
             for (lower, upper), band in FREQ_BAND_MAP.items():
                 if lower <= freq_mhz <= upper:
                     self.band_input.setCurrentText(band)
                     return
         except ValueError:
             pass # Ignore if input is not a valid float
-            
+
     def setup_dynamic_sections(self):
         sat_layout = QFormLayout(self.satellite_frame); self.sat_name_input = QLineEdit(); self.prop_mode_input = QLineEdit()
         sat_layout.addRow("卫星名称:", self.sat_name_input); sat_layout.addRow("传播模式:", self.prop_mode_input)
         rep_layout = QFormLayout(self.repeater_frame); self.repeater_call_input = QLineEdit()
         rep_layout.addRow("中继呼号:", self.repeater_call_input)
         eye_layout = QFormLayout(self.eyeball_frame)
-        self.eyeball_type_input = QComboBox(); self.eyeball_type_input.addItems(["线下聚会", "线上EYEBALL", "俱乐部活动", "其他"])
+        self.eyeball_type_input = QComboBox(); self.eyeball_type_input.addItems(["EYEBALL", "Online EYEBALL", "Club activity", "Other"])
         eye_layout.addRow("Eyeball 类型:", self.eyeball_type_input)
+
     def update_form_layout(self):
-        qso_type = self.qso_type_combo.currentText(); is_sat = "卫星" in qso_type; is_rep = "中继" in qso_type; is_eye = "Eyeball" in qso_type
+        qso_type = self.qso_type_combo.currentText()
+        is_sat = "Satellite" in qso_type
+        is_rep = "Repeater" in qso_type
+        is_eye = "Eyeball" in qso_type
         self.satellite_frame.setVisible(is_sat); self.repeater_frame.setVisible(is_rep); self.eyeball_frame.setVisible(is_eye)
         if is_eye:
             self.mode_input.setCurrentText("EYEBALL"); self.band_input.setCurrentText("N/A"); self.band_rx_input.setCurrentText("N/A")
             self.rst_sent_input.setText("59+"); self.rst_rcvd_input.setText("59+")
         else:
             if self.mode_input.currentText() == "EYEBALL": self.mode_input.setCurrentIndex(0)
+
     def populate_data(self):
         if not self.is_edit_mode:
             utc_now = QDateTime.currentDateTimeUtc()
             self.qso_date_input.setDateTime(utc_now)
             self.time_on_input.setText(utc_now.time().toString("hhmm"))
             self.rst_sent_input.setText("59"); self.rst_rcvd_input.setText("59"); self.update_form_layout(); return
+        
         log_data = self.db_manager.get_log_details(self.log_id)
         if not log_data: QMessageBox.critical(self, "错误", "无法加载日志详情。"); self.reject(); return
-        qso_type_to_set = "基础 (HF/VHF/UHF)"
-        if log_data['sat_name']: 
-            qso_type_to_set = "卫星 (Satellite)"
-        elif log_data['mode'] == 'EYEBALL': 
+        
+        qso_type_to_set = "Basic (HF/VHF/UHF)"
+        if log_data['sat_name']:
+            qso_type_to_set = "Satellite"
+        elif log_data['mode'] == 'EYEBALL':
             qso_type_to_set = "Eyeball"
         elif log_data['freq_rx'] and (log_data['mode'] or "").upper() == 'FM':
-            qso_type_to_set = "中继 (Repeater)"
+            qso_type_to_set = "Repeater"
+            
         self.qso_type_combo.blockSignals(True); self.qso_type_combo.setCurrentText(qso_type_to_set); self.qso_type_combo.blockSignals(False)
         self.callsign_input.setText(log_data['station_callsign'] or '')
         try:
@@ -418,11 +726,12 @@ class LogDetailDialog(QDialog):
             if card['direction'] == 'RC': self.rc_card_label.setText(card['qsl_id'])
             elif card['direction'] == 'TC': self.tc_card_label.setText(card['qsl_id'])
         self.update_form_layout()
+        
     def get_data(self) -> dict:
         data = { "station_callsign": self.callsign_input.text().upper(), "qso_date": self.qso_date_input.date().toString("yyyyMMdd"), "time_on": self.time_on_input.text(), "band": self.band_input.currentText(), "band_rx": self.band_rx_input.currentText(), "freq": self.freq_input.text(), "freq_rx": self.freq_rx_input.text(), "mode": self.mode_input.currentText(), "rst_sent": self.rst_sent_input.text(), "rst_rcvd": self.rst_rcvd_input.text(), "comment": self.comment_input.toPlainText(), "my_callsign": self.my_callsign, "sat_name": None, "prop_mode": None, "submode": None }
         qso_type = self.qso_type_combo.currentText()
-        if "卫星" in qso_type: data.update({"sat_name": self.sat_name_input.text(), "prop_mode": self.prop_mode_input.text()})
-        elif "中继" in qso_type:
+        if "Satellite" in qso_type: data.update({"sat_name": self.sat_name_input.text(), "prop_mode": self.prop_mode_input.text()})
+        elif "Repeater" in qso_type:
             repeater_call = self.repeater_call_input.text()
             if repeater_call: data["comment"] = f"RPT: {repeater_call} | {data['comment']}"
         elif "Eyeball" in qso_type: data["submode"] = self.eyeball_type_input.currentText()
@@ -442,13 +751,13 @@ class LogTableModel(QAbstractTableModel):
     def data(self, index, role):
         if not index.isValid():
             return None
-            
+
         column = index.column()
         row = index.row()
 
         if role == Qt.CheckStateRole and column == 0:
             return self._checked_states[row]
-            
+
         value = self._data[row][column - 1] if column > 0 else None
 
         if role == Qt.DisplayRole:
@@ -464,9 +773,9 @@ class LogTableModel(QAbstractTableModel):
         if role == Qt.TextAlignmentRole:
             if column in self._special_cols:
                 return Qt.AlignCenter
-        
+
         return None
-    
+
     def setData(self, index, value, role):
         if role == Qt.CheckStateRole and index.column() == 0:
             self._checked_states[index.row()] = value; self.dataChanged.emit(index, index); return True
@@ -508,9 +817,11 @@ class LogManagementWidget(QWidget):
         main_layout.addWidget(self.table_view)
         bottom_button_layout = QHBoxLayout()
         self.card_in_button = QPushButton("确认收卡 (RC)"); self.card_out_button = QPushButton("确认发卡 (TC)")
-        self.reprint_button = QPushButton("补打标签"); self.check_duplicates_button = QPushButton("检查并合并重复项")
+        self.reprint_button = QPushButton("补打标签"); self.write_nfc_button = QPushButton("写入NFC") # New Button
+        self.check_duplicates_button = QPushButton("检查并合并重复项")
         self.recycle_card_button = QPushButton("回收卡号"); self.delete_log_button = QPushButton("删除日志")
         bottom_button_layout.addWidget(self.card_in_button); bottom_button_layout.addWidget(self.card_out_button); bottom_button_layout.addWidget(self.reprint_button)
+        bottom_button_layout.addWidget(self.write_nfc_button); # Add to layout
         bottom_button_layout.addWidget(self.check_duplicates_button); bottom_button_layout.addWidget(self.recycle_card_button); bottom_button_layout.addWidget(self.delete_log_button)
         bottom_button_layout.addStretch(); self.back_button = QPushButton("返回主菜单"); bottom_button_layout.addWidget(self.back_button)
         main_layout.addLayout(bottom_button_layout)
@@ -523,10 +834,11 @@ class LogManagementWidget(QWidget):
         self.mode_filter.currentIndexChanged.connect(self.apply_filters); self.reset_button.clicked.connect(self.reset_filters)
         self.reorder_button.clicked.connect(self.reorder_logs)
         self.card_in_button.clicked.connect(lambda: self.process_qsl_cards('RC')); self.card_out_button.clicked.connect(lambda: self.process_qsl_cards('TC'))
-        self.reprint_button.clicked.connect(self.reprint_label); self.check_duplicates_button.clicked.connect(self.check_for_duplicates)
+        self.reprint_button.clicked.connect(self.reprint_label); self.write_nfc_button.clicked.connect(self.write_nfc_card) # Connect new button
+        self.check_duplicates_button.clicked.connect(self.check_for_duplicates)
         self.delete_log_button.clicked.connect(self.delete_selected_logs); self.recycle_card_button.clicked.connect(self.recycle_selected_card)
         self.table_view.doubleClicked.connect(self.edit_selected_log); self.back_button.clicked.connect(self.back_to_dashboard_signal.emit)
-            
+
     def load_initial_data(self):
         self.headers = ["ID", "我方呼号", "对方呼号", "日期", "时间", "TX 波段", "RX 波段", "TX 频率", "RX 频率", "模式", "已发?", "已收?", "备注"]
         self.model = LogTableModel([], self.headers); self.table_view.setModel(self.model); self.table_view.setColumnWidth(0, 40); self.apply_filters()
@@ -544,11 +856,11 @@ class LogManagementWidget(QWidget):
                 self.data_changed_signal.emit()
             else:
                 QMessageBox.critical(self, "失败", "重新排序时发生数据库错误。")
-                
+
     def process_qsl_cards(self, direction):
         log_ids_to_process = []
         skipped_count = 0
-        
+
         for log_id in self.model.get_checked_log_ids():
             log_details = self.db_manager.get_log_details(log_id)
             if not log_details: continue
@@ -560,7 +872,7 @@ class LogManagementWidget(QWidget):
                 skipped_count += 1
                 continue
             log_ids_to_process.append(log_id)
-        
+
         if not log_ids_to_process:
             QMessageBox.information(self, "操作提示", f"所有勾选的日志都已经有相应的卡片记录，已全部跳过。")
             return
@@ -568,36 +880,39 @@ class LogManagementWidget(QWidget):
         mode = "multi"
         if len(log_ids_to_process) > 1:
             dialog = BatchQslModeDialog(len(log_ids_to_process), self)
-            if dialog.exec_() == QDialog.Accepted: mode = dialog.mode
+            if dialog.exec() == QDialog.Accepted: mode = dialog.mode
             else: return
 
-        output_dialog = OutputModeDialog(self)
-        if output_dialog.exec_() != QDialog.Accepted: return
-        output_mode = output_dialog.mode
+        layout_dialog = PrintLayoutDialog(self)
+        if layout_dialog.exec() != QDialog.Accepted:
+            return
 
+        if layout_dialog.layout_choice == 1:
+            self.run_print_job(NewLayoutPrinter.generate_layout_1, log_ids_to_process, direction, mode)
+        elif layout_dialog.layout_choice == 2:
+            self.run_print_job(NewLayoutPrinter.generate_layout_2, log_ids_to_process, direction, mode)
+        
+        self.apply_filters()
+        self.data_changed_signal.emit()
+
+    def run_print_job(self, print_function, log_ids, direction, mode):
         processed_count = 0
         if mode == "single":
             qsl_id = QSL_ID_Generator.generate(self.db_manager, direction)
-            if self.db_manager.add_qsl_card(qsl_id, log_ids_to_process, direction):
-                processed_count = len(log_ids_to_process)
-                log_data_list = [self.db_manager.get_log_details(log_id) for log_id in log_ids_to_process]
-                LabelPrinter.generate_label(qsl_id, log_data_list, self, output_mode)
-        else:
-            for log_id in log_ids_to_process:
+            if self.db_manager.add_qsl_card(qsl_id, log_ids, direction):
+                processed_count = len(log_ids)
+                log_data_list = [self.db_manager.get_log_details(log_id) for log_id in log_ids]
+                print_function(qsl_id, log_data_list, self)
+        else: # multi mode
+            for log_id in log_ids:
                 qsl_id = QSL_ID_Generator.generate(self.db_manager, direction)
                 if self.db_manager.add_qsl_card(qsl_id, [log_id], direction):
                     processed_count += 1
                     log_data_list = [self.db_manager.get_log_details(log_id)]
-                    LabelPrinter.generate_label(qsl_id, log_data_list, self, output_mode)
+                    print_function(qsl_id, log_data_list, self)
         
         if processed_count > 0:
-            msg = f"成功为 {processed_count} 条日志生成卡片。"
-            if skipped_count > 0:
-                msg += f"\n跳过 {skipped_count} 条已有记录的日志。"
-            QMessageBox.information(self, "操作成功", msg)
-        
-        self.apply_filters()
-        self.data_changed_signal.emit()
+            QMessageBox.information(self, "操作成功", f"成功为 {processed_count} 条日志生成卡片。")
 
     def reprint_label(self):
         log_ids = self.model.get_checked_log_ids()
@@ -610,32 +925,58 @@ class LogManagementWidget(QWidget):
             return
 
         log_id = log_ids[0]
-        
+
         cards = self.db_manager.get_qsl_cards_for_log(log_id)
         if not cards:
             QMessageBox.information(self, "提示", "所选日志没有关联的QSL卡。")
             return
-            
+
         dialog = CardActionDialog("选择要补打的标签", cards, self)
         if dialog.exec_() == QDialog.Accepted and dialog.selected_card_info:
             qsl_id_to_print = dialog.selected_card_info['qsl_id']
-            
+
             logs_for_this_card = self.db_manager.get_logs_for_qsl_card(qsl_id_to_print)
             if not logs_for_this_card:
                 QMessageBox.critical(self, "数据库错误", f"找不到卡号 {qsl_id_to_print} 关联的日志。")
                 return
 
             log_data_list = [self.db_manager.get_log_details(lid['log_id']) for lid in logs_for_this_card]
+
+            layout_dialog = PrintLayoutDialog(self)
+            if layout_dialog.exec() != QDialog.Accepted: return
             
-            output_dialog = OutputModeDialog(self)
-            if output_dialog.exec_() == QDialog.Accepted:
-                LabelPrinter.generate_label(qsl_id_to_print, log_data_list, self, output_dialog.mode)
-            
+            if layout_dialog.layout_choice == 1:
+                NewLayoutPrinter.generate_layout_1(qsl_id_to_print, log_data_list, self)
+            elif layout_dialog.layout_choice == 2:
+                NewLayoutPrinter.generate_layout_2(qsl_id_to_print, log_data_list, self)
+
+    def write_nfc_card(self):
+        """Handle writing an existing QSL ID to an NFC card."""
+        log_ids = self.model.get_checked_log_ids()
+
+        if len(log_ids) != 1:
+            QMessageBox.warning(self, "操作提示", "请勾选一条且仅一条日志来写入NFC卡。")
+            return
+
+        log_id = log_ids[0]
+        cards = self.db_manager.get_qsl_cards_for_log(log_id)
+
+        if not cards:
+            QMessageBox.information(self, "无卡号", "所选日志没有关联的QSL卡号，无法写入。")
+            return
+
+        dialog = CardActionDialog("选择要写入NFC的卡号", cards, self)
+        if dialog.exec_() == QDialog.Accepted and dialog.selected_card_info:
+            qsl_id_to_write = dialog.selected_card_info['qsl_id']
+            nfc_dialog = NfcWriteDialog(qsl_id_to_write, self)
+            nfc_dialog.exec_()
+
+
     def edit_selected_log(self, index):
         log_id = self.model.data(self.model.index(index.row(), 1), Qt.DisplayRole)
         my_callsign = self.model.data(self.model.index(index.row(), 2), Qt.DisplayRole)
         dialog = LogDetailDialog(self.db_manager, my_callsign, log_id, self)
-        if dialog.exec_() == QDialog.Accepted:
+        if dialog.exec() == QDialog.Accepted:
             updated_data = dialog.get_data()
             if self.db_manager.update_log_entry(log_id, updated_data): QMessageBox.information(self, "成功", f"日志 (ID: {log_id}) 已更新。"); self.apply_filters()
             else: QMessageBox.critical(self, "错误", "无法更新日志。")
@@ -647,7 +988,7 @@ class LogManagementWidget(QWidget):
         if not duplicate_sets:
             QMessageBox.information(self, "查重完成", "未发现重复的日志记录。")
             return
-        
+
         merged_count = 0
         for duplicate_set in duplicate_sets:
             log_ids = sorted(list(duplicate_set))
@@ -655,7 +996,7 @@ class LogManagementWidget(QWidget):
             master_log_data = dict(self.db_manager.get_log_details(master_log_id))
 
             logs_to_delete = []
-            
+
             for i in range(1, len(log_ids)):
                 duplicate_log_id = log_ids[i]
                 duplicate_log_data_row = self.db_manager.get_log_details(duplicate_log_id)
@@ -669,20 +1010,19 @@ class LogManagementWidget(QWidget):
                     if new_value and not master_log_data.get(key):
                         master_log_data[key] = new_value
                         needs_update = True
-                
+
                 new_comment = duplicate_log_data.get('comment', ''); old_comment = master_log_data.get('comment', '')
                 if new_comment and new_comment not in (old_comment or ""):
-                    master_log_data['comment'] = f"{old_comment or ''} | MERGED: {new_comment}".strip(" | ")
-                    needs_update = True
-                
+                    master_log_data['comment'] = f"{old_comment or ''} | MERGED: {new_comment}".strip(" | "); needs_update = True
+
                 logs_to_delete.append(duplicate_log_id)
 
             if needs_update:
                 self.db_manager.update_log_entry(master_log_id, master_log_data)
-            
+
             for log_id_to_delete in logs_to_delete:
                 self.db_manager.delete_log(log_id_to_delete)
-            
+
             merged_count += 1
 
         QMessageBox.information(self, "合并完成", f"已自动合并 {merged_count} 组重复的日志记录。")
@@ -690,7 +1030,7 @@ class LogManagementWidget(QWidget):
     def delete_selected_logs(self):
         log_ids = self.model.get_checked_log_ids()
         if not log_ids: QMessageBox.warning(self, "操作提示", "请先在表格中勾选要删除的日志。"); return
-        
+
         reply = QMessageBox.question(self, "确认删除", f"您确定要永久删除选中的 {len(log_ids)} 条日志吗？\n此操作不可恢复！", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply == QMessageBox.Yes:
             deleted_count = 0
@@ -701,24 +1041,24 @@ class LogManagementWidget(QWidget):
     def recycle_selected_card(self):
         log_ids = self.model.get_checked_log_ids()
         if len(log_ids) != 1: QMessageBox.warning(self, "操作提示", "请勾选一条且仅一条日志来回收其关联的QSL卡号。"); return
-        
+
         log_id = log_ids[0]
         cards = self.db_manager.get_qsl_cards_for_log(log_id)
         if not cards: QMessageBox.information(self, "提示", "该日志没有关联的QSL卡，无需回收。"); return
-            
+
         dialog = CardActionDialog("选择要回收的卡号", cards, self)
-        if dialog.exec_() == QDialog.Accepted and dialog.selected_card_info:
+        if dialog.exec() == QDialog.Accepted and dialog.selected_card_info:
             direction = dialog.selected_card_info['direction']
             if self.db_manager.recycle_qsl_card(log_id, direction):
                 QMessageBox.information(self, "操作成功", f"成功回收该日志的 {direction} 卡号。")
                 self.apply_filters(); self.data_changed_signal.emit()
             else: QMessageBox.warning(self, "操作失败", "无法回收卡号。")
-
+            
 # --- Hardware Control Widget ---
 class HardwareWidget(QWidget):
     back_to_dashboard_signal = pyqtSignal()
     search_qsl_id_signal = pyqtSignal(str)
-    
+
     def __init__(self, db_manager, parent=None):
         super().__init__(parent)
         self.db_manager = db_manager
@@ -733,7 +1073,7 @@ class HardwareWidget(QWidget):
         left_pane = QWidget()
         left_layout = QVBoxLayout(left_pane)
         left_layout.setContentsMargins(0, 0, 0, 0)
-        
+
         # Manual Input Group
         input_zone = QGroupBox("手动输入")
         input_layout = QVBoxLayout(input_zone)
@@ -741,7 +1081,7 @@ class HardwareWidget(QWidget):
         self.manual_input.textChanged.connect(lambda text: self.manual_input.setText(text.upper()))
         self.manual_input.returnPressed.connect(self.search_manual_code)
         input_layout.addWidget(self.manual_input)
-        
+
         left_layout.addWidget(input_zone)
         left_layout.addStretch(1)
 
@@ -749,26 +1089,26 @@ class HardwareWidget(QWidget):
         right_pane = QGroupBox("查询结果")
         right_layout = QVBoxLayout(right_pane)
         self.results_browser = QTextBrowser()
-        self.results_browser.setStyleSheet("font-size: 28px;") 
+        self.results_browser.setStyleSheet("font-size: 28px;")
         right_layout.addWidget(self.results_browser)
 
         # --- Main Layout Assembly ---
         main_layout.addWidget(left_pane, 1)
         main_layout.addWidget(right_pane, 2)
-        
+
         # --- Bottom Bar for Back Button ---
         back_button_layout = QHBoxLayout();
         back_button_layout.addStretch()
         self.back_button = QPushButton("返回主菜单");
         back_button_layout.addWidget(self.back_button)
-        
+
         top_level_layout.addLayout(main_layout)
         top_level_layout.addLayout(back_button_layout)
-        
+
         # Connections
         self.back_button.clicked.connect(self.leave_view)
         self.back_button.clicked.connect(self.back_to_dashboard_signal.emit)
-        
+
     def search_manual_code(self):
         code = self.manual_input.text().strip().upper()
         if code:
@@ -777,7 +1117,7 @@ class HardwareWidget(QWidget):
 
     def _perform_search(self, qsl_id_prefix):
         matching_qsl_cards = self.db_manager.get_logs_for_qsl_id_prefix(qsl_id_prefix)
-        
+
         if not matching_qsl_cards:
             self.results_browser.setHtml(f"<h3>未找到与 QSL 卡号 '{qsl_id_prefix}' 相关的日志。</h3>")
             return
@@ -786,7 +1126,7 @@ class HardwareWidget(QWidget):
         for card_row in matching_qsl_cards:
             full_qsl_id = card_row['qsl_id']
             full_html += f"<h3>QSL 卡号: {full_qsl_id}</h3>"
-            
+
             logs_for_this_card = self.db_manager.get_logs_for_qsl_card(full_qsl_id)
 
             if logs_for_this_card:
@@ -796,19 +1136,19 @@ class HardwareWidget(QWidget):
                     log_details = dict(self.db_manager.get_log_details(log_row['log_id']))
                     if log_details:
                         details_html = f"""
-                            <p>
-                            <b>对方呼号:</b> {log_details.get('station_callsign', '')}<br>
-                            <b>我方呼号:</b> {log_details.get('my_callsign', '')}<br>
-                            <b>日期/时间 (UTC):</b> {log_details.get('qso_date', '')} / {log_details.get('time_on', '')}Z<br>
-                            <b>频率/波段:</b> {log_details.get('freq', 'N/A')} MHz / {log_details.get('band', 'N/A')}<br>
-                            <b>模式:</b> {log_details.get('mode', '')} {log_details.get('submode', '') or ''}<br>
-                            <b>信号报告 (S/R):</b> {log_details.get('rst_sent', '')} / {log_details.get('rst_rcvd', '')}<br>
-                        """
+                                <p>
+                                <b>对方呼号:</b> {log_details.get('station_callsign', '')}<br>
+                                <b>我方呼号:</b> {log_details.get('my_callsign', '')}<br>
+                                <b>日期/时间 (UTC):</b> {log_details.get('qso_date', '')} / {log_details.get('time_on', '')}Z<br>
+                                <b>频率/波段:</b> {log_details.get('freq', 'N/A')} MHz / {log_details.get('band', 'N/A')}<br>
+                                <b>模式:</b> {log_details.get('mode', '')} {log_details.get('submode', '') or ''}<br>
+                                <b>信号报告 (S/R):</b> {log_details.get('rst_sent', '')} / {log_details.get('rst_rcvd', '')}<br>
+                            """
                         if log_details.get('sat_name'):
                             details_html += f"<b>卫星:</b> {log_details['sat_name']}<br>"
                         if log_details.get('comment'):
-                             details_html += f"<b>备注:</b> {log_details['comment']}"
-                        
+                                details_html += f"<b>备注:</b> {log_details['comment']}"
+
                         details_html += "</p>"
                         full_html += details_html
 
@@ -817,13 +1157,17 @@ class HardwareWidget(QWidget):
             full_html += "<hr style='border: 1px solid #7f8c8d;'>"
 
         self.results_browser.setHtml(full_html.removesuffix("<hr style='border: 1px solid #7f8c8d;'>"))
-    
+
     def enter_view(self):
         self.manual_input.setFocus()
 
     def leave_view(self):
         self.manual_input.clear()
         self.results_browser.clear()
+    
+    def closeEvent(self, event):
+        # Placeholder for any cleanup needed when the window closes
+        pass
 
 # --- Main Application Window ---
 class MainWindow(QMainWindow):
@@ -841,28 +1185,50 @@ class MainWindow(QMainWindow):
         self.central_widget = QWidget(); self.setCentralWidget(self.central_widget)
         self.main_layout = QVBoxLayout(self.central_widget); self.stacked_widget = QStackedWidget()
         self.main_layout.addWidget(self.stacked_widget); self.create_dashboard_view()
-        self.log_management_view = LogManagementWidget(self.db_manager); self.hardware_view = HardwareWidget(self.db_manager)
+        self.log_management_view = LogManagementWidget(self.db_manager)
+        self.hardware_view = HardwareWidget(self.db_manager)
+        
         self.log_management_view.back_to_dashboard_signal.connect(self.show_dashboard)
         self.log_management_view.data_changed_signal.connect(self.update_dashboard_stats)
-        self.hardware_view.back_to_dashboard_signal.connect(self.show_dashboard); 
-        self.stacked_widget.addWidget(self.log_management_view); self.stacked_widget.addWidget(self.hardware_view)
+        self.hardware_view.back_to_dashboard_signal.connect(self.show_dashboard)
+        
+        self.stacked_widget.addWidget(self.log_management_view)
+        self.stacked_widget.addWidget(self.hardware_view)
+        
         self.stacked_widget.setCurrentWidget(self.dashboard_view)
+
     def show_dashboard(self):
-        self.hardware_view.leave_view() 
+        self.hardware_view.leave_view()
         self.log_management_view.reset_filters()
         self.stacked_widget.setCurrentWidget(self.dashboard_view); self.update_dashboard_stats()
+
     def create_dashboard_view(self):
         self.dashboard_view = QWidget(); self.dashboard_view.setObjectName("dashboard_view"); main_hbox = QHBoxLayout(self.dashboard_view)
         tile_widget = QWidget(); tile_layout = QGridLayout(tile_widget)
-        tiles = {"new_log": ("新通联日志", self.on_new_log_clicked), "log_management": ("日志管理", self.on_log_manage_clicked), "import_adif": ("导入ADIF", self.on_import_clicked), "hardware_scan": ("手动查询", self.on_scan_clicked), "settings": ("设置", self.on_settings_clicked)}
+        tiles = {
+            "new_log": ("新通联日志", self.on_new_log_clicked), 
+            "log_management": ("日志管理", self.on_log_manage_clicked), 
+            "import_adif": ("导入ADIF", self.on_import_clicked), 
+            "hardware_scan": ("手动查询", self.on_scan_clicked),
+            "settings": ("设置", self.on_settings_clicked)
+        }
         positions = [(0,0), (0,1), (1,0), (1,1), (2,0)]
-        for position, (key, (text, func)) in zip(positions, tiles.items()):
-            button = QPushButton(text); button.setObjectName("tileButton")
-            button.setMinimumSize(180, 120); button.clicked.connect(func); tile_layout.addWidget(button, *position)
         
+        # Unpack items safely
+        items = list(tiles.items())
+        
+        for i, position in enumerate(positions):
+            if i < len(items):
+                key, (text, func) = items[i]
+                button = QPushButton(text)
+                button.setObjectName("tileButton")
+                button.setMinimumSize(180, 120)
+                button.clicked.connect(func)
+                tile_layout.addWidget(button, *position)
+
         self.quit_button = QPushButton("退出系统"); self.quit_button.setObjectName("quitButton")
         self.quit_button.setMinimumSize(180, 120); self.quit_button.clicked.connect(self.close)
-        tile_layout.addWidget(self.quit_button, 2, 1)
+        tile_layout.addWidget(self.quit_button, 2, 1) # Span across two columns
 
         main_hbox.addWidget(tile_widget, 1) # Changed stretch factor
         stats_widget = QFrame(); stats_widget.setFrameShape(QFrame.StyledPanel); stats_vbox = QVBoxLayout(stats_widget)
@@ -891,7 +1257,7 @@ class MainWindow(QMainWindow):
         primary_callsign = ConfigManager.get_config("primary_callsign")
         if not primary_callsign: QMessageBox.information(self, "设置提示", "请先在“设置”中添加并设置一个主要呼号。"); self.on_settings_clicked(); return
         dialog = LogDetailDialog(self.db_manager, my_callsign=primary_callsign, parent=self)
-        if dialog.exec_() == QDialog.Accepted:
+        if dialog.exec() == QDialog.Accepted:
             log_data = dialog.get_data()
             if self.db_manager.log_exists(log_data['station_callsign'], log_data['qso_date'], log_data['time_on'], log_data['band'], log_data['mode']):
                 QMessageBox.warning(self, "重复日志", "该通联记录已存在，无法重复添加。"); return
@@ -911,22 +1277,22 @@ class MainWindow(QMainWindow):
             for qso in qsos:
                 band = qso.get('BAND', '')
                 if not all(k in qso for k in ['CALL', 'QSO_DATE', 'TIME_ON', 'BAND']): continue
-                
+
                 existing_log_id = self.db_manager.log_exists(qso['CALL'], qso['QSO_DATE'], qso['TIME_ON'], band, qso.get('MODE'))
                 if existing_log_id:
                     existing_log = self.db_manager.get_log_details(existing_log_id)
                     merged_data = dict(existing_log); needs_update = False
-                    
+
                     new_log_data = {'station_callsign': qso.get('CALL'), 'qso_date': qso.get('QSO_DATE'), 'time_on': qso.get('TIME_ON'), 'band': band, 'band_rx': qso.get('BAND_RX'), 'freq': qso.get('FREQ'), 'freq_rx': qso.get('FREQ_RX'), 'mode': qso.get('MODE'), 'rst_sent': qso.get('RST_SENT'), 'rst_rcvd': qso.get('RST_RCVD'), 'comment': qso.get('COMMENT', ''), 'my_callsign': qso.get('OPERATOR', primary_callsign), 'submode': qso.get('SUBMODE'), 'sat_name': qso.get('SAT_NAME'), 'prop_mode': qso.get('PROP_MODE')}
 
                     for key, new_value in new_log_data.items():
                         if new_value and not merged_data.get(key):
                             merged_data[key] = new_value; needs_update = True
-                    
+
                     new_comment = new_log_data.get('comment', ''); old_comment = merged_data.get('comment', '')
                     if new_comment and new_comment not in (old_comment or ""):
                         merged_data['comment'] = f"{old_comment or ''} | IMPORTED: {new_comment}".strip(" | "); needs_update = True
-                    
+
                     if needs_update:
                         self.db_manager.update_log_entry(existing_log_id, merged_data); updated_count += 1
                     else: duplicate_count += 1
@@ -938,10 +1304,11 @@ class MainWindow(QMainWindow):
             if self.stacked_widget.currentWidget() == self.log_management_view: self.log_management_view.apply_filters()
             self.update_dashboard_stats()
         except Exception as e: QMessageBox.critical(self, "导入失败", f"无法解析或处理ADIF文件。\n错误: {e}")
-    def on_scan_clicked(self): 
+    def on_scan_clicked(self):
         self.hardware_view.enter_view()
         self.stacked_widget.setCurrentWidget(self.hardware_view)
-    def on_settings_clicked(self): dialog = SettingsDialog(self.db_manager, self); dialog.data_changed.connect(self.update_dashboard_stats); dialog.exec_()
+        
+    def on_settings_clicked(self): dialog = SettingsDialog(self.db_manager, self); dialog.data_changed.connect(self.update_dashboard_stats); dialog.exec()
     def closeEvent(self, event): self.hardware_view.closeEvent(event); self.db_manager.close(); event.accept()
     def search_by_qsl_id(self, qsl_id):
         self.stacked_widget.setCurrentWidget(self.log_management_view); self.log_management_view.search_by_qsl_id(qsl_id)
@@ -995,7 +1362,7 @@ class DatabaseManager:
     def search_logs(self, station_callsign=None, my_callsign=None, mode=None, qsl_id=None):
         params = []; db_columns = ["l.id", "l.my_callsign", "l.station_callsign", "l.qso_date", "l.time_on", "l.band", "l.band_rx", "l.freq", "l.freq_rx", "l.mode", "l.qsl_sent", "l.qsl_rcvd", "l.comment"]
         col_string = ", ".join(db_columns); base_query = f"SELECT DISTINCT {col_string} FROM logs l"; joins = ""; conditions = " WHERE 1=1"
-        if qsl_id and qsl_id.strip(): 
+        if qsl_id and qsl_id.strip():
             joins += " JOIN qsl_log_link ql ON l.id = ql.log_id JOIN qsl_cards q ON ql.qsl_id = q.qsl_id"
             conditions += " AND UPPER(q.qsl_id) LIKE ?"
             params.append(f"{qsl_id.strip().upper()}%")
@@ -1030,14 +1397,14 @@ class DatabaseManager:
                 (group['station_callsign'].upper(), group['qso_date'], (group['band'] or "").upper(), (group['mode'] or "").upper())
             )
             if len(logs_in_group) < 2: continue
-            
+
             visited_indices = set()
             for i in range(len(logs_in_group)):
                 if i in visited_indices: continue
                 current_set = {logs_in_group[i]['id']}
                 try: time_i = datetime.datetime.strptime(logs_in_group[i]['time_on'].zfill(6), '%H%M%S')
                 except (ValueError, AttributeError): continue
-                
+
                 for j in range(i + 1, len(logs_in_group)):
                     if j in visited_indices: continue
                     try:
@@ -1063,7 +1430,7 @@ class DatabaseManager:
         except sqlite3.OperationalError:
             self.execute_query("ALTER TABLE logs ADD COLUMN sort_id INTEGER")
             self.execute_query("UPDATE logs SET sort_id = id")
-            
+
     def reorder_logs_by_time(self):
         try:
             logs = self.fetch_all("SELECT id, qso_date, time_on FROM logs ORDER BY qso_date, time_on")
@@ -1113,7 +1480,7 @@ class QSL_ID_Generator:
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
-    
+
     missing_libs = []
     try: import adif_io
     except ImportError: missing_libs.append('adif-io')
@@ -1125,11 +1492,14 @@ if __name__ == '__main__':
     except ImportError: missing_libs.append('Pillow')
     try: import fitz
     except ImportError: missing_libs.append('PyMuPDF')
-        
+    try: import serial
+    except ImportError: missing_libs.append('pyserial')
+
+
     if missing_libs:
         QMessageBox.critical(None, "缺少依赖库", f"检测到缺少以下必要的库:\n\n{', '.join(missing_libs)}\n\n请在终端中运行 'pip install --upgrade <library_name>' 来安装或更新它们。")
         sys.exit(1)
-        
+
     os.makedirs("assets", exist_ok=True)
     with open(STYLE_SHEET_FILE, "w", encoding="utf-8") as f:
         f.write("""
@@ -1144,7 +1514,8 @@ if __name__ == '__main__':
     QPushButton#tileButton:hover { background-color: #3498db; color: #ffffff; }
     QPushButton#quitButton { background-color: #c0392b; border: 2px solid #e74c3c; border-radius: 10px; padding: 20px; font-size: 30px; font-weight: bold; }
     QPushButton#quitButton:hover { background-color: #e74c3c; }
-    QLineEdit, QDateEdit, QTextEdit, QListWidget { background-color: #2c3e50; border: 1px solid #7f8c8d; border-radius: 4px; padding: 8px; color: #ecf0f1; }
+    QLineEdit, QDateEdit, QTextEdit, QListWidget, QSpinBox, QCheckBox { background-color: #2c3e50; border: 1px solid #7f8c8d; border-radius: 4px; padding: 8px; color: #ecf0f1; }
+    QCheckBox { border: none; }
     QLineEdit:read-only { background-color: #34495e; }
     QFrame { border: 1px solid #7f8c8d; border-radius: 5px; }
     QTableView { border: 1px solid #7f8c8d; gridline-color: #7f8c8d; }
@@ -1154,7 +1525,8 @@ if __name__ == '__main__':
     QDialog { border: 1px solid #7f8c8d; }
     QLabel#statsHeader { font-size: 16px; font-weight: bold; color: #3498db; margin-top: 10px; border: none; }
     QListWidget { border: none; }
+    QSplitter::handle { background-color: #7f8c8d; }
     """)
     main_win = MainWindow()
-    main_win.show()
-    sys.exit(app.exec_())
+    main_win.showMaximized()
+    app.exec()
