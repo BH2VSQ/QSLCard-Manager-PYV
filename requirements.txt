@@ -1,0 +1,1 @@
+pip install pyinstaller PyQt5 adif-io qrcode reportlab Pillow PyMuPDF pyserial

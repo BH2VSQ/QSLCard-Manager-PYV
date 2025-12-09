@@ -1,0 +1,11 @@
+pyinstaller --name="QSL_Manager" ^
+--icon="icon.ico" ^
+--add-data="MapleMonoNL-Regular.ttf;." ^
+--add-data="Cinese.ttf;." ^
+--onefile ^
+--hidden-import="pkg_resources.py2_warn" ^
+--hidden-import="PIL.ImageTk" ^
+--hidden-import="PyQt5.sip" ^
+--exclude="torch" ^
+--noconsole ^
+main.py
