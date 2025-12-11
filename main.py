@@ -872,7 +872,7 @@ class LogDetailDialog(QDialog):
         title = "编辑通联日志" if self.is_edit_mode else f"添加新通联日志 - [{self.my_callsign}]"
         self.setWindowTitle(title)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
-        self.setFixedSize(1000, 1200)
+        self.setFixedSize(1000, 1500)
         layout = QVBoxLayout(self)
         self.qso_type_combo = QComboBox(); self.qso_type_combo.addItems(["Basic (HF/VHF/UHF)", "Satellite", "Repeater", "Eyeball"])
         self.qso_type_combo.currentIndexChanged.connect(self.update_form_layout)
@@ -899,6 +899,19 @@ class LogDetailDialog(QDialog):
         self.setup_dynamic_sections()
         self.form_layout.addRow(self.satellite_frame); self.form_layout.addRow(self.repeater_frame); self.form_layout.addRow(self.eyeball_frame)
         self.form_layout.addRow("备注:", self.comment_input); layout.addLayout(self.form_layout)
+        self.rst_sent_input = QLineEdit(); self.rst_rcvd_input = QLineEdit(); self.comment_input = QTextEdit()
+        
+        # --- 新增: QSL日期编辑框 ---
+        self.qsl_sent_date_input = QLineEdit()
+        self.qsl_sent_date_input.setPlaceholderText("YYYYMMDD (留空则未发)")
+        self.qsl_rcvd_date_input = QLineEdit()
+        self.qsl_rcvd_date_input.setPlaceholderText("YYYYMMDD (留空则未收)")
+        # -------------------------
+        
+        # --- 新增: 将日期输入框添加到布局 ---
+        self.form_layout.addRow("发卡时间 (Date):", self.qsl_sent_date_input)
+        self.form_layout.addRow("收卡时间 (Date):", self.qsl_rcvd_date_input)
+        # ---------------------------------
         if self.is_edit_mode:
             qsl_frame = QFrame(); qsl_frame.setFrameShape(QFrame.StyledPanel); qsl_layout = QFormLayout(qsl_frame)
             self.rc_card_label = QLineEdit("N/A"); self.rc_card_label.setReadOnly(True); self.tc_card_label = QLineEdit("N/A"); self.tc_card_label.setReadOnly(True)
@@ -956,6 +969,18 @@ class LogDetailDialog(QDialog):
         log_data = self.db_manager.get_log_details(self.log_id)
         if not log_data: QMessageBox.critical(self, "错误", "无法加载日志详情。"); self.reject(); return
         
+        # ... 中间代码保持不变 ...
+        
+        self.rst_sent_input.setText(log_data['rst_sent'] or ''); self.rst_rcvd_input.setText(log_data['rst_rcvd'] or '')
+        self.comment_input.setPlainText(log_data['comment'] or ''); self.sat_name_input.setText(log_data['sat_name'] or ''); self.prop_mode_input.setText(log_data['prop_mode'] or '')
+        
+        # --- 新增: 加载 QSL 时间 ---
+        self.qsl_sent_date_input.setText(log_data['qsl_sent_date'] or '')
+        self.qsl_rcvd_date_input.setText(log_data['qsl_rcvd_date'] or '')
+        # -------------------------
+
+        if log_data['submode']: self.eyeball_type_input.setCurrentText(log_data['submode'])
+        
         qso_type_to_set = "Basic (HF/VHF/UHF)"
         if log_data['sat_name']:
             qso_type_to_set = "Satellite"
@@ -984,7 +1009,27 @@ class LogDetailDialog(QDialog):
         self.update_form_layout()
         
     def get_data(self) -> dict:
-        data = { "station_callsign": self.callsign_input.text().upper(), "qso_date": self.qso_date_input.date().toString("yyyyMMdd"), "time_on": self.time_on_input.text(), "band": self.band_input.currentText(), "band_rx": self.band_rx_input.currentText(), "freq": self.freq_input.text(), "freq_rx": self.freq_rx_input.text(), "mode": self.mode_input.currentText(), "rst_sent": self.rst_sent_input.text(), "rst_rcvd": self.rst_rcvd_input.text(), "comment": self.comment_input.toPlainText(), "my_callsign": self.my_callsign, "sat_name": None, "prop_mode": None, "submode": None }
+        data = { 
+            "station_callsign": self.callsign_input.text().upper(), 
+            "qso_date": self.qso_date_input.date().toString("yyyyMMdd"), 
+            "time_on": self.time_on_input.text(), 
+            "band": self.band_input.currentText(), 
+            "band_rx": self.band_rx_input.currentText(), 
+            "freq": self.freq_input.text(), 
+            "freq_rx": self.freq_rx_input.text(), 
+            "mode": self.mode_input.currentText(), 
+            "rst_sent": self.rst_sent_input.text(), 
+            "rst_rcvd": self.rst_rcvd_input.text(), 
+            "comment": self.comment_input.toPlainText(), 
+            "my_callsign": self.my_callsign, 
+            "sat_name": None, 
+            "prop_mode": None, 
+            "submode": None,
+            # --- 新增: 获取 QSL 时间 ---
+            "qsl_sent_date": self.qsl_sent_date_input.text().strip() or None,
+            "qsl_rcvd_date": self.qsl_rcvd_date_input.text().strip() or None
+            # -------------------------
+        }
         qso_type = self.qso_type_combo.currentText()
         if "Satellite" in qso_type: data.update({"sat_name": self.sat_name_input.text(), "prop_mode": self.prop_mode_input.text()})
         elif "Repeater" in qso_type:
@@ -1592,7 +1637,12 @@ class DatabaseManager:
     def delete_callsign(self, callsign): return self.execute_query("DELETE FROM callsigns WHERE callsign = ?", (callsign,))
     def add_log_entry(self, log_data):
         log_data['adif_blob'] = json.dumps(log_data)
-        query = "INSERT INTO logs (my_callsign, station_callsign, qso_date, time_on, band, band_rx, freq, freq_rx, mode, rst_sent, rst_rcvd, comment, adif_blob, submode, sat_name, prop_mode) VALUES (:my_callsign, :station_callsign, :qso_date, :time_on, :band, :band_rx, :freq, :freq_rx, :mode, :rst_sent, :rst_rcvd, :comment, :adif_blob, :submode, :sat_name, :prop_mode)"
+        # 增加 qsl_sent_date 和 qsl_rcvd_date
+        query = "INSERT INTO logs (my_callsign, station_callsign, qso_date, time_on, band, band_rx, freq, freq_rx, mode, rst_sent, rst_rcvd, comment, adif_blob, submode, sat_name, prop_mode, qsl_sent_date, qsl_rcvd_date) VALUES (:my_callsign, :station_callsign, :qso_date, :time_on, :band, :band_rx, :freq, :freq_rx, :mode, :rst_sent, :rst_rcvd, :comment, :adif_blob, :submode, :sat_name, :prop_mode, :qsl_sent_date, :qsl_rcvd_date)"
+        # 确保字典中有这两个键，防止报错
+        log_data.setdefault('qsl_sent_date', None)
+        log_data.setdefault('qsl_rcvd_date', None)
+        
         if self.execute_query(query, log_data):
             log_id = self.cursor.lastrowid
             self.execute_query("UPDATE logs SET sort_id = ? WHERE id = ?", (log_id, log_id))
@@ -1600,16 +1650,31 @@ class DatabaseManager:
         return None
     def update_log_entry(self, log_id, log_data):
         log_data['adif_blob'] = json.dumps(log_data); log_data['log_id'] = log_id
-        query = "UPDATE logs SET station_callsign=:station_callsign, qso_date=:qso_date, time_on=:time_on, band=:band, band_rx=:band_rx, freq=:freq, freq_rx=:freq_rx, mode=:mode, rst_sent=:rst_sent, rst_rcvd=:rst_rcvd, comment=:comment, adif_blob=:adif_blob, submode=:submode, sat_name=:sat_name, prop_mode=:prop_mode WHERE id=:log_id"
+        # 增加 qsl_sent_date 和 qsl_rcvd_date 的更新
+        query = "UPDATE logs SET station_callsign=:station_callsign, qso_date=:qso_date, time_on=:time_on, band=:band, band_rx=:band_rx, freq=:freq, freq_rx=:freq_rx, mode=:mode, rst_sent=:rst_sent, rst_rcvd=:rst_rcvd, comment=:comment, adif_blob=:adif_blob, submode=:submode, sat_name=:sat_name, prop_mode=:prop_mode, qsl_sent_date=:qsl_sent_date, qsl_rcvd_date=:qsl_rcvd_date WHERE id=:log_id"
+        # 确保字典中有这两个键
+        log_data.setdefault('qsl_sent_date', None)
+        log_data.setdefault('qsl_rcvd_date', None)
         return self.execute_query(query, log_data)
     def add_qsl_card(self, qsl_id, log_ids: list, direction):
         try:
             now = datetime.datetime.now().isoformat()
+            current_date_str = datetime.datetime.now().strftime('%Y%m%d') # ADIF 格式日期
+            
             self.cursor.execute("INSERT INTO qsl_cards (qsl_id, direction, status, created_at) VALUES (?, ?, ?, ?)", (qsl_id, direction, 'In Stock', now))
             for log_id in log_ids: self.cursor.execute("INSERT INTO qsl_log_link (qsl_id, log_id) VALUES (?, ?)", (qsl_id, log_id))
-            status_field = "qsl_rcvd" if direction == 'RC' else "qsl_sent"
-            placeholders = ', '.join('?' for _ in log_ids)
-            self.cursor.execute(f"UPDATE logs SET {status_field} = 'Y' WHERE id IN ({placeholders})", log_ids)
+            
+            if direction == 'RC':
+                # 收卡：更新状态为 Y，并设置收卡时间
+                placeholders = ', '.join('?' for _ in log_ids)
+                params = [current_date_str] + log_ids
+                self.cursor.execute(f"UPDATE logs SET qsl_rcvd = 'Y', qsl_rcvd_date = ? WHERE id IN ({placeholders})", params)
+            else:
+                # 发卡：更新状态为 Y，并设置发卡时间
+                placeholders = ', '.join('?' for _ in log_ids)
+                params = [current_date_str] + log_ids
+                self.cursor.execute(f"UPDATE logs SET qsl_sent = 'Y', qsl_sent_date = ? WHERE id IN ({placeholders})", params)
+                
             self.conn.commit(); return True
         except sqlite3.Error as e: print(f"Error adding QSL card: {e}"); self.conn.rollback(); return False
     def get_log_details(self, log_id): return self.fetch_one("SELECT * FROM logs WHERE id = ?", (log_id,))
@@ -1678,7 +1743,13 @@ class DatabaseManager:
                     duplicate_sets.append(current_set)
         return duplicate_sets
     def initialize_database(self):
-        queries = ["CREATE TABLE IF NOT EXISTS callsigns (callsign TEXT PRIMARY KEY)", "CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY, sort_id INTEGER, my_callsign TEXT, station_callsign TEXT, qso_date TEXT, time_on TEXT, band TEXT, band_rx TEXT, freq REAL, freq_rx REAL, mode TEXT, submode TEXT, rst_sent TEXT, rst_rcvd TEXT, comment TEXT, adif_blob TEXT, qsl_sent TEXT DEFAULT 'N', qsl_rcvd TEXT DEFAULT 'N', sat_name TEXT, prop_mode TEXT)", "CREATE TABLE IF NOT EXISTS qsl_cards (qsl_id TEXT PRIMARY KEY, direction TEXT NOT NULL, status TEXT, location TEXT, created_at TEXT NOT NULL)", "CREATE TABLE IF NOT EXISTS qsl_log_link (qsl_id TEXT NOT NULL, log_id INTEGER NOT NULL, PRIMARY KEY (qsl_id, log_id), FOREIGN KEY (qsl_id) REFERENCES qsl_cards (qsl_id) ON DELETE CASCADE, FOREIGN KEY (log_id) REFERENCES logs (id) ON DELETE CASCADE)"]
+        queries = [
+            "CREATE TABLE IF NOT EXISTS callsigns (callsign TEXT PRIMARY KEY)",
+            # 注意：下面的 CREATE TABLE logs 定义中增加了 qsl_sent_date 和 qsl_rcvd_date
+            "CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY, sort_id INTEGER, my_callsign TEXT, station_callsign TEXT, qso_date TEXT, time_on TEXT, band TEXT, band_rx TEXT, freq REAL, freq_rx REAL, mode TEXT, submode TEXT, rst_sent TEXT, rst_rcvd TEXT, comment TEXT, adif_blob TEXT, qsl_sent TEXT DEFAULT 'N', qsl_rcvd TEXT DEFAULT 'N', sat_name TEXT, prop_mode TEXT, qsl_sent_date TEXT, qsl_rcvd_date TEXT)",
+            "CREATE TABLE IF NOT EXISTS qsl_cards (qsl_id TEXT PRIMARY KEY, direction TEXT NOT NULL, status TEXT, location TEXT, created_at TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS qsl_log_link (qsl_id TEXT NOT NULL, log_id INTEGER NOT NULL, PRIMARY KEY (qsl_id, log_id), FOREIGN KEY (qsl_id) REFERENCES qsl_cards (qsl_id) ON DELETE CASCADE, FOREIGN KEY (log_id) REFERENCES logs (id) ON DELETE CASCADE)"
+        ]
         try:
             for query in queries:
                 self.cursor.execute(query)
@@ -1686,6 +1757,25 @@ class DatabaseManager:
         except sqlite3.Error as e:
             print(f"Database initialization error: {e}")
             self.conn.rollback()
+
+        # --- 新增：数据库迁移逻辑 (检查并添加新字段，处理旧数据) ---
+        try:
+            self.cursor.execute("SELECT qsl_sent_date FROM logs LIMIT 1")
+        except sqlite3.OperationalError:
+            # 如果字段不存在，则添加
+            print("Detected old database version. Migrating schema...")
+            try:
+                self.execute_query("ALTER TABLE logs ADD COLUMN qsl_sent_date TEXT")
+                self.execute_query("ALTER TABLE logs ADD COLUMN qsl_rcvd_date TEXT")
+                
+                # 迁移旧数据：如果已发卡/收卡但没有日期，默认使用 QSO 日期
+                self.execute_query("UPDATE logs SET qsl_sent_date = qso_date WHERE qsl_sent = 'Y' AND (qsl_sent_date IS NULL OR qsl_sent_date = '')")
+                self.execute_query("UPDATE logs SET qsl_rcvd_date = qso_date WHERE qsl_rcvd = 'Y' AND (qsl_rcvd_date IS NULL OR qsl_rcvd_date = '')")
+                self.conn.commit()
+                print("Schema migration and data backfill completed.")
+            except sqlite3.Error as e:
+                print(f"Migration failed: {e}")
+        # --------------------------------------------------------
 
         try:
             self.cursor.execute("SELECT sort_id FROM logs LIMIT 1")
