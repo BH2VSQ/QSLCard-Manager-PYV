@@ -899,7 +899,7 @@ class LogDetailDialog(QDialog):
         self.setup_dynamic_sections()
         self.form_layout.addRow(self.satellite_frame); self.form_layout.addRow(self.repeater_frame); self.form_layout.addRow(self.eyeball_frame)
         self.form_layout.addRow("备注:", self.comment_input); layout.addLayout(self.form_layout)
-        self.rst_sent_input = QLineEdit(); self.rst_rcvd_input = QLineEdit(); self.comment_input = QTextEdit()
+        #self.rst_sent_input = QLineEdit(); self.rst_rcvd_input = QLineEdit(); self.comment_input = QTextEdit()
         
         # --- 新增: QSL日期编辑框 ---
         self.qsl_sent_date_input = QLineEdit()
