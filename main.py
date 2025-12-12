@@ -144,40 +144,51 @@ class NewLayoutPrinter:
     @staticmethod
     def _setup_fonts():
         """
-        设置字体。优先使用自定义字体，失败则回退到 ReportLab CJK 标准字体 (STSong-Light)。
+        设置 ReportLab 使用的中英文混合字体。
+        在 PyInstaller 打包环境下，使用 sys._MEIPASS 查找资源文件路径。
+        仅使用基本的 TTFont 和 registerFontFamily 注册，兼容不支持 registerFontAlias 的旧版本。
         """
-        if NewLayoutPrinter._fonts_registered:
-            # 确保在自定义字体失败时，STSong-Light 始终是已注册的状态
-            return (NewLayoutPrinter._eng_font, NewLayoutPrinter._zh_font)
+        # 确定资源文件的基本路径 (PyInstaller 兼容性)
+        if getattr(sys, 'frozen', False):
+            base_path = sys._MEIPASS
+        else:
+            base_path = os.path.dirname(os.path.abspath(__file__))
 
-        # --- 1. 设置英文字体 (保持不变) ---
-        # 假设 ENG_FONT_FILE/ZH_FONT_FILE 已经在文件顶部定义
-        # ... (英文字体加载逻辑) ...
+        ENGLISH_FONT_FILE = "MapleMonoNL-Regular.ttf"
+        CHINESE_FONT_FILE = "Cinese.ttf"
         
-        # --- 2. 设置中文字体 ---
-        NewLayoutPrinter._zh_font = 'STSong-Light' # 默认设置为 ReportLab CJK
+        # 保持英文字体名称
+        FONT_NAME_EN = "MapleMono-Regular"
         
-        # A. 尝试加载自定义中文字体
-        if os.path.exists(ZH_FONT_FILE):
-            try:
-                pdfmetrics.registerFont(TTFont('CineseFont', ZH_FONT_FILE))
-                NewLayoutPrinter._zh_font = 'CineseFont'
-            except Exception as e:
-                print(f"自定义中文字体加载失败，回退到 STSong-Light: {e}")
-                
-        # B. 注册 ReportLab 标准 CJK 字体 (如果自定义字体失败或我们仍使用默认值)
-        # 必须显式注册 STSong-Light 才能让 ReportLab 识别它
+        # 中文字体使用自定义名称
+        FONT_NAME_ZH = "Custom-Chinese-Font"
+
+        en_font_path = os.path.join(base_path, ENGLISH_FONT_FILE)
+        zh_font_path = os.path.join(base_path, CHINESE_FONT_FILE)
+
+        # 1. 注册英文字体
         try:
-            # 注册为 CID 字体
-            pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
+            pdfmetrics.registerFont(TTFont(FONT_NAME_EN, en_font_path))
         except Exception as e:
-            # 如果连 ReportLab 自身的标准字体都无法注册，则退回到最安全的英文/拉丁字体，避免程序崩溃。
-            print(f"STSong-Light 注册失败，可能缺少相关系统文件: {e}")
-            NewLayoutPrinter._zh_font = NewLayoutPrinter._eng_font # 使用英文或通用字体作为最后 fallback
+            print(f"Error registering English font: {e}")
+            FONT_NAME_EN = 'Helvetica'
 
-        NewLayoutPrinter._fonts_registered = True
-        return (NewLayoutPrinter._eng_font, NewLayoutPrinter._zh_font)
+        # 2. 注册中文字体 (仅使用基础注册方法)
+        try:
+            # A. 注册 TTF 文件
+            pdfmetrics.registerFont(TTFont(FONT_NAME_ZH, zh_font_path))
+            
+            # B. 注册字体家族 (Font Family)
+            pdfmetrics.registerFontFamily(FONT_NAME_ZH, normal=FONT_NAME_ZH)
+            
+            # --- 注意：已移除所有 pdfmetrics.registerFontAlias 的调用 ---
+            
+        except Exception as e:
+            print(f"Error registering Chinese font: {e}")
+            # 如果注册失败，回退到英文字体
+            FONT_NAME_ZH = FONT_NAME_EN 
 
+        return FONT_NAME_EN, FONT_NAME_ZH
     @staticmethod
     def _print_file(file_path):
         """触发Windows默认打印机打印文件"""
@@ -295,6 +306,8 @@ class NewLayoutPrinter:
         QR_BOX_SIZE = 10 
         # 4. QR Code 边框大小 (0为无边框，最小化尺寸)
         QR_BORDER = 0
+        # 5. 二维码垂直偏移量 (正值向上移动，负值向下移动)
+        QR_Y_OFFSET_MM = 17 * mm # 建议从 1.5mm 开始测试
         # -----------------------------------------------------------------
 
         # 尺寸定义
@@ -350,7 +363,7 @@ class NewLayoutPrinter:
                 # --- Row 0: Header ---
                 
                 # 绘制 To Radio 固定文本 (放大字体)
-                header_text = "To Radio : "
+                header_text = "To Radio:"
                 header_font_size = 14 # 固定文字使用 12pt
                 
                 # 绘制对方呼号 <His call> (较小字体)
@@ -419,8 +432,8 @@ class NewLayoutPrinter:
 
                     for col_idx, text in zip(base_cols, base_row_data):
                         cx, cy = get_cell_center(current_grid_row, col_idx, sub_row=0)
-                        font_size = 7
-                        if len(text) > 7: font_size = 6 # Auto shrink
+                        font_size = 6
+                        if len(text) > 7: font_size = 5 # Auto shrink
                         NewLayoutPrinter._draw_mixed_string(c, cx, cy, text, fonts, font_size, align='center')
 
                     # 频率 (MHz) 判定逻辑 (Col 3)
@@ -469,15 +482,15 @@ class NewLayoutPrinter:
                         
                     # 绘制备注 (左侧) - 对齐到 Col 0 中心
                     if comment_text:
-                        NewLayoutPrinter._draw_mixed_string(c, QSO_LINE2_ALIGN_X, cy_bottom, comment_text, fonts, 7, align='left')
+                        NewLayoutPrinter._draw_mixed_string(c, QSO_LINE2_ALIGN_X, cy_bottom, comment_text, fonts, 6, align='left')
                         
                         # 卫星信息在备注右侧，留出间距
-                        comment_width = pdfmetrics.stringWidth(comment_text, fonts[1], 7) 
+                        comment_width = pdfmetrics.stringWidth(comment_text, fonts[1], 6) 
                         cx_info = QSO_LINE2_ALIGN_X + comment_width + 3*mm # 3mm 间距
-                        NewLayoutPrinter._draw_mixed_string(c, cx_info, cy_bottom, info_text, fonts, 7, align='left')
+                        NewLayoutPrinter._draw_mixed_string(c, cx_info, cy_bottom, info_text, fonts, 6, align='left')
                     else:
                          # 如果没有备注，则卫星信息从 Col 0 中心开始
-                        NewLayoutPrinter._draw_mixed_string(c, QSO_LINE2_ALIGN_X, cy_bottom, info_text, fonts, 7, align='left')
+                        NewLayoutPrinter._draw_mixed_string(c, QSO_LINE2_ALIGN_X, cy_bottom, info_text, fonts, 6, align='left')
                         
                     # ----------------------------------------------------
                     # C. 绘制水平分隔线 (仅在 Row 2, 3, 4 底部绘制)
@@ -505,7 +518,8 @@ class NewLayoutPrinter:
 
                 # 2. 计算区域中心点
                 center_x = qr_area_x_start + (qr_area_width / 2)
-                center_y = qr_area_y_bottom + (qr_area_height / 2)
+                # [修改行] 使用偏移量 QR_Y_OFFSET_MM (正值向上)
+                center_y = qr_area_y_bottom + (qr_area_height / 2) + QR_Y_OFFSET_MM
 
                 # 3. 确定二维码绘制尺寸 (使用定义的变量)
                 qr_size_mm = min(QR_SIZE_MM, qr_area_height - 2*mm, qr_area_width - 2*mm) # 留出 2mm 边距
