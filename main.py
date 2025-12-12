@@ -42,7 +42,7 @@ try:
     # -------------------------
     from PIL import Image
     from PIL import Image
-    from PIL.ImageQt import ImageQt
+    #from PIL.ImageQt import ImageQt
     import fitz # PyMuPDF
     import serial
     import serial.tools.list_ports
@@ -544,7 +544,8 @@ class NewLayoutPrinter:
             QMessageBox.information(
                 parent_widget, 
                 "标签生成成功", 
-                f"QSL 标签 ({L_WIDTH/mm}mm x {L_HEIGHT/mm}mm, 版式 1) 已生成文件。即将发送到打印队列！"
+                #f"QSL 标签 ({L_WIDTH/mm}mm x {L_HEIGHT/mm}mm, 版式 1) 已生成文件。即将发送到打印队列！"
+                f"QSL 标签 (70mm x 50mm) 已生成文件。即将发送到打印队列！"
             )
         # ----------------------------------------------------
 
@@ -616,6 +617,156 @@ class NewLayoutPrinter:
             NewLayoutPrinter._render_and_output_as_png(qsl_id, pdf_buffer, parent_widget)
         except Exception as e:
             QMessageBox.critical(None, "操作失败", f"生成版式2时出错: {e}")
+
+    # --- [REPLACE generate_address_label METHOD in NewLayoutPrinter] ---
+    @staticmethod
+    def generate_address_label(sender_info, receiver_info, parent_widget):
+        """
+        生成 70mm x 50mm 地址标签 (分页显示：P1发件人，P2收件人)
+        特性：支持管道符(|)强制换行；无管道符时，启用核心行政词 + 16字长度限制自适应换行。
+        顶部增加 FROM:/TO: 标题，并增加顶部间距。
+        """
+        ADDRESS_DIR = "address"
+        os.makedirs(ADDRESS_DIR, exist_ok=True)
+        
+        filename_id = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        pdf_buffer = BytesIO()
+        
+        # 尺寸定义
+        L_WIDTH, L_HEIGHT = 70 * mm, 50 * mm
+        MARGIN = 3 * mm
+        
+        # --- 地址智能分行函数 (逻辑保持不变) ---
+        def smart_split_address(raw_addr):
+            if '|' in raw_addr:
+                return [line.strip() for line in raw_addr.split('|') if line.strip()]
+
+            lines = []
+            current_line = ""
+            CORE_KEYWORDS = ['省', '市', '州', '县', '区'] 
+            MAX_LEN = 16 
+            MIN_LEN_FOR_KEYWORD_BREAK = 5 
+
+            raw_addr = raw_addr.replace(' ', '').replace('\t', '')
+            
+            i = 0
+            while i < len(raw_addr):
+                char = raw_addr[i]
+                current_line += char
+                i += 1
+                
+                current_len = len(current_line)
+
+                # 规则 A: 关键词触发的换行
+                if current_len >= MIN_LEN_FOR_KEYWORD_BREAK:
+                    is_keyword_end = False
+                    for kw in CORE_KEYWORDS:
+                        if current_line.endswith(kw):
+                            is_keyword_end = True
+                            break
+                    
+                    if is_keyword_end:
+                        lines.append(current_line)
+                        current_line = ""
+                        continue
+
+                # 规则 B: 长度强制截断
+                if current_len >= MAX_LEN:
+                    lines.append(current_line[:MAX_LEN])
+                    current_line = current_line[MAX_LEN:]
+                    # 确保索引 i 正确处理了剩余部分
+                    i = i - len(current_line) 
+
+            if current_line:
+                lines.append(current_line)
+                
+            return [line for line in lines if line]
+        # --- 结束：地址智能分行函数 ---
+
+
+        try:
+            fonts = NewLayoutPrinter._setup_fonts()
+            c = canvas.Canvas(pdf_buffer, pagesize=(L_WIDTH, L_HEIGHT))
+            import re # 确保 re 库被导入
+
+            def draw_single_label(info_dict, role_suffix):
+                FONT_SIZE_TITLE = 12 
+                FONT_SIZE_NORMAL = 10
+                FONT_SIZE_LARGE = 12
+                LINE_SPACING = 5 * mm
+                
+                # --- 关键修改：增加顶部间距 ---
+                # 设定顶部文字基线距离标签顶部边缘 8 mm (原约为 6mm)
+                TOP_SPACE_FROM_EDGE = 8 * mm 
+                current_y = L_HEIGHT - TOP_SPACE_FROM_EDGE
+                
+                # --- 标题行 ---
+                if role_suffix == "发":
+                    title_text = "FROM(发自):"
+                else: 
+                    title_text = "TO(发往):"
+                    
+                NewLayoutPrinter._draw_mixed_string(c, MARGIN, current_y, title_text, fonts, FONT_SIZE_TITLE, align='left')
+                current_y -= LINE_SPACING # 标题占一行空间
+
+                # 1. 邮编 (Zip) 
+                zip_text = f"{info_dict.get('zip', '')}"
+                NewLayoutPrinter._draw_mixed_string(c, MARGIN, current_y, zip_text, fonts, FONT_SIZE_NORMAL, align='left')
+                current_y -= LINE_SPACING
+
+                # 2. 地址 (Address) - 调用智能分行
+                final_lines = smart_split_address(info_dict.get('address', ''))
+                
+                # 绘制地址行
+                for line in final_lines:
+                    if current_y < 15 * mm: break # 防止覆盖底部信息
+                    NewLayoutPrinter._draw_mixed_string(c, MARGIN, current_y, line, fonts, FONT_SIZE_NORMAL, align='left')
+                    current_y -= (LINE_SPACING * 0.9)
+
+                current_y -= 1 * mm # 地址与姓名的间距
+
+                # 3. 姓名 (Name) + (收/发)
+                name_text = f"{info_dict.get('name', '')} "
+                NewLayoutPrinter._draw_mixed_string(c, MARGIN, current_y, name_text, fonts, FONT_SIZE_LARGE, align='left')
+                current_y -= LINE_SPACING
+
+                # 4. 电话 (Phone)
+                phone_text = info_dict.get('phone', '')
+                if phone_text:
+                    phone_text = f"TEL: {phone_text}"
+                    NewLayoutPrinter._draw_mixed_string(c, MARGIN, current_y, phone_text, fonts, FONT_SIZE_NORMAL, align='left')
+                    current_y -= LINE_SPACING
+
+                # 5. 国家 (Country)
+                country_text = info_dict.get('country', '')
+                if country_text:
+                    NewLayoutPrinter._draw_mixed_string(c, MARGIN, current_y, country_text, fonts, FONT_SIZE_LARGE, align='left')
+
+            # --- 绘制 P1: 发件人 ---
+            draw_single_label(sender_info, "发")
+            c.showPage()
+
+            # --- 绘制 P2: 收件人 ---
+            draw_single_label(receiver_info, "收")
+            c.showPage()
+
+            c.save()
+
+            # --- 输出与打印 ---
+            final_pdf_path = os.path.join(ADDRESS_DIR, f"addr_{filename_id}.pdf")
+            with open(final_pdf_path, "wb") as f:
+                f.write(pdf_buffer.getvalue())
+            
+            NewLayoutPrinter._print_file(final_pdf_path)
+            
+            return True
+
+        except Exception as e:
+            QMessageBox.critical(parent_widget, "生成失败", f"生成地址标签时出错: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
 # --- NFC Writer Class ---
 class NFCWriter:
     @staticmethod
@@ -862,6 +1013,145 @@ class SettingsDialog(QDialog):
         current_item = self.callsign_list.currentItem()
         if not current_item: QMessageBox.warning(self, "操作提示", "请先选择一个要设为主用的呼号。"); return
         callsign = current_item.text(); ConfigManager.set_config("primary_callsign", callsign); self.load_settings(); QMessageBox.information(self, "成功", f"'{callsign}' 已被设为您的主要呼号。")
+
+# --- [REPLACE AddressLabelDialog CLASS] ---
+class AddressLabelDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("打印地址标签 (70x50mm)")
+        
+        # --- 核心修改：固定窗口尺寸并禁用调整 ---
+        # 设定固定尺寸 (宽度520, 高度650)
+        FIXED_WIDTH = 1500
+        FIXED_HEIGHT = 950
+        self.setFixedSize(FIXED_WIDTH, FIXED_HEIGHT) 
+        
+        # 禁用最大化按钮和尺寸调整
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint) 
+        # Qt.WindowCloseButtonHint | Qt.MSWindowsFixedSizeDialogHint 是另一种确保尺寸固定的方法
+        
+        main_layout = QVBoxLayout(self)
+        
+        # 1. 寄件人信息 (自动保存)
+        sender_group = QGroupBox("寄件人信息 (自动保存)")
+        sender_form = QFormLayout(sender_group)
+        self.s_name = QLineEdit()
+        self.s_phone = QLineEdit()
+        self.s_zip = QLineEdit()
+        self.s_country = QLineEdit() 
+        self.s_country.setPlaceholderText("可选 (例如: P.R. China)")
+        self.s_addr = QTextEdit()
+        self.s_addr.setMaximumHeight(60)
+        self.s_addr.setPlaceholderText("可使用管道符(|)强制换行；无|时将按核心行政区域词换行，每行最多16字。") 
+        
+        sender_form.addRow("姓名:", self.s_name)
+        sender_form.addRow("电话:", self.s_phone)
+        sender_form.addRow("邮编:", self.s_zip)
+        sender_form.addRow("国家:", self.s_country)
+        sender_form.addRow("地址:", self.s_addr)
+        main_layout.addWidget(sender_group)
+        
+        # 2. 收件人信息
+        receiver_group = QGroupBox("收件人信息")
+        receiver_form = QFormLayout(receiver_group)
+        self.r_name = QLineEdit()
+        self.r_phone = QLineEdit()
+        self.r_zip = QLineEdit()
+        self.r_country = QLineEdit() 
+        self.r_country.setPlaceholderText("可选")
+        self.r_addr = QTextEdit()
+        self.r_addr.setMaximumHeight(80)
+        self.r_addr.setPlaceholderText("可使用管道符(|)强制换行；无|时将按核心行政区域词换行，每行最多16字。")
+        
+        receiver_form.addRow("姓名:", self.r_name)
+        receiver_form.addRow("电话:", self.r_phone)
+        receiver_form.addRow("邮编:", self.r_zip)
+        receiver_form.addRow("国家:", self.r_country)
+        
+        # 常用操作按钮
+        btn_row = QHBoxLayout()
+        self.clear_btn = QPushButton("清空收件人")
+        self.paste_btn = QPushButton("从剪贴板识别(简易)")
+        btn_row.addWidget(self.clear_btn)
+        btn_row.addWidget(self.paste_btn)
+        
+        receiver_form.addRow("地址:", self.r_addr)
+        receiver_form.addRow(btn_row)
+        main_layout.addWidget(receiver_group)
+        
+        # 3. 打印按钮
+        self.print_btn = QPushButton("生成并打印")
+        self.print_btn.setStyleSheet("background-color: #27ae60; height: 50px; font-size: 20px; font-weight: bold;")
+        main_layout.addWidget(self.print_btn)
+        
+        # 信号连接
+        self.print_btn.clicked.connect(self.do_print)
+        self.clear_btn.clicked.connect(self.clear_receiver)
+        self.paste_btn.clicked.connect(self.parse_clipboard)
+        
+        # 加载配置
+        self.load_sender_config()
+    
+    def load_sender_config(self):
+        self.s_name.setText(ConfigManager.get_config("addr_s_name", ""))
+        self.s_phone.setText(ConfigManager.get_config("addr_s_phone", ""))
+        self.s_zip.setText(ConfigManager.get_config("addr_s_zip", ""))
+        self.s_country.setText(ConfigManager.get_config("addr_s_country", "")) # 加载国家
+        self.s_addr.setPlainText(ConfigManager.get_config("addr_s_addr", ""))
+
+    def save_sender_config(self):
+        ConfigManager.set_config("addr_s_name", self.s_name.text())
+        ConfigManager.set_config("addr_s_phone", self.s_phone.text())
+        ConfigManager.set_config("addr_s_zip", self.s_zip.text())
+        ConfigManager.set_config("addr_s_country", self.s_country.text()) # 保存国家
+        ConfigManager.set_config("addr_s_addr", self.s_addr.toPlainText())
+
+    def clear_receiver(self):
+        self.r_name.clear()
+        self.r_phone.clear()
+        self.r_zip.clear()
+        self.r_country.clear() # 清空国家
+        self.r_addr.clear()
+
+    def parse_clipboard(self):
+        # 简易识别逻辑
+        clipboard = QApplication.clipboard()
+        text = clipboard.text()
+        if not text: return
+        parts = text.replace('，', ' ').replace(',', ' ').split()
+        if len(parts) >= 1: self.r_name.setText(parts[0])
+        if len(parts) >= 2: 
+            if parts[1].isdigit() and len(parts[1]) > 6:
+                self.r_phone.setText(parts[1])
+            else:
+                self.r_addr.setPlainText(parts[1])
+        if len(parts) >= 3:
+             self.r_addr.setPlainText("".join(parts[2:]))
+
+    def do_print(self):
+        self.save_sender_config()
+        
+        sender = {
+            'name': self.s_name.text(),
+            'phone': self.s_phone.text(),
+            'zip': self.s_zip.text(),
+            'country': self.s_country.text(), # 收集国家字段
+            'address': self.s_addr.toPlainText()
+        }
+        receiver = {
+            'name': self.r_name.text(),
+            'phone': self.r_phone.text(),
+            'zip': self.r_zip.text(),
+            'country': self.r_country.text(), # 收集国家字段
+            'address': self.r_addr.toPlainText()
+        }
+        
+        if not receiver['name'] or not receiver['address']:
+            QMessageBox.warning(self, "信息不全", "请至少填写收件人姓名和地址。")
+            return
+
+        if NewLayoutPrinter.generate_address_label(sender, receiver, self):
+            QMessageBox.information(self, "成功", "地址标签已生成并发送至打印队列。")
 
 # --- Log Detail/Edit Dialog ---
 class LogDetailDialog(QDialog):
@@ -1512,14 +1802,19 @@ class MainWindow(QMainWindow):
     def create_dashboard_view(self):
         self.dashboard_view = QWidget(); self.dashboard_view.setObjectName("dashboard_view"); main_hbox = QHBoxLayout(self.dashboard_view)
         tile_widget = QWidget(); tile_layout = QGridLayout(tile_widget)
+        
+        # --- [MODIFIED SECTION START] ---
         tiles = {
             "new_log": ("新通联日志", self.on_new_log_clicked), 
             "log_management": ("日志管理", self.on_log_manage_clicked), 
             "import_adif": ("导入ADIF", self.on_import_clicked), 
             "hardware_scan": ("手动查询", self.on_scan_clicked),
+            "address_label": ("打印地址标签", self.on_address_label_clicked), # <--- 新增
             "settings": ("设置", self.on_settings_clicked)
         }
-        positions = [(0,0), (0,1), (1,0), (1,1), (2,0)]
+        # 更新布局坐标，确保放得下 (3行2列)
+        positions = [(0,0), (0,1), (1,0), (1,1), (2,0), (2,1)] 
+        # --- [MODIFIED SECTION END] ---
         
         # Unpack items safely
         items = list(tiles.items())
@@ -1534,8 +1829,9 @@ class MainWindow(QMainWindow):
                 tile_layout.addWidget(button, *position)
 
         self.quit_button = QPushButton("退出系统"); self.quit_button.setObjectName("quitButton")
+        # 修改退出按钮的位置到第 3 行，跨两列（如果不想覆盖地址标签按钮，可以调整到 row 3）
         self.quit_button.setMinimumSize(180, 120); self.quit_button.clicked.connect(self.close)
-        tile_layout.addWidget(self.quit_button, 2, 1) # Span across two columns
+        tile_layout.addWidget(self.quit_button, 3, 0, 1, 2) # Moved to Row 3, Span 2 columns
 
         main_hbox.addWidget(tile_widget, 1) # Changed stretch factor
         stats_widget = QFrame(); stats_widget.setFrameShape(QFrame.StyledPanel); stats_vbox = QVBoxLayout(stats_widget)
@@ -1560,6 +1856,9 @@ class MainWindow(QMainWindow):
             list_item = QListWidgetItem(); label = QLabel(item_text); label.setStyleSheet(f"color: {color};")
             self.activity_list.addItem(list_item); self.activity_list.setItemWidget(list_item, label)
     def init_database(self): self.db_manager.initialize_database(); print("Database initialized successfully.")
+    def on_address_label_clicked(self):
+        dialog = AddressLabelDialog(self)
+        dialog.exec_()
     def on_new_log_clicked(self):
         primary_callsign = ConfigManager.get_config("primary_callsign")
         if not primary_callsign: QMessageBox.information(self, "设置提示", "请先在“设置”中添加并设置一个主要呼号。"); self.on_settings_clicked(); return
