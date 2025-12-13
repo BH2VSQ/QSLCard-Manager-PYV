@@ -56,7 +56,6 @@ except ImportError as e:
     pass
 
 # --- Constants ---
-DEFAULT_TO_LAYOUT_1 = True #是否开启版式选择，True为默认版式1，False为选择版式1和版式2
 PRINTS_DIR = "print"# ✨ 新增：PDF 缓存文件目录
 DB_FILE = "database/qsl_manager.db"
 LOGBOOK_FILE = "logbook.adi"
@@ -289,10 +288,12 @@ class NewLayoutPrinter:
     @staticmethod
     def generate_layout_1(qsl_id, log_data_list, parent_widget):
         """
-        生成 70mm x 50mm 标签, 6x6 网格布局，QSO行上下分割。
+        生成 70mm x 50mm 标签。
+        1-N页：6x6 网格布局的 QSO 数据。
+        最后一页：独立的 QSL ID 和 居中二维码（用于贴信封）。
         """
         os.makedirs(LABELS_DIR, exist_ok=True)
-        os.makedirs(PRINTS_DIR, exist_ok=True) # ✨ 这行代码会创建 'print' 文件夹（如果不存在）
+        os.makedirs(PRINTS_DIR, exist_ok=True)
         pdf_buffer = BytesIO()
         
         # -----------------------------------------------------------------
@@ -309,18 +310,24 @@ class NewLayoutPrinter:
         # 5. 二维码垂直偏移量 (正值向上移动，负值向下移动)
         QR_Y_OFFSET_MM = 17 * mm # 建议从 1.5mm 开始测试
         # -----------------------------------------------------------------
+        # 【最后一页专属：二维码手动调节变量区域】
+        # -----------------------------------------------------------------
+        QR_PAGE_SIZE_MM = 35 * mm  # 最后一页二维码的尺寸（默认35mm，可调）
+        QR_PAGE_FONT_SIZE = 12     # 最后一页 QSL ID 的字体大小
+        QR_PAGE_Y_OFFSET = 5 * mm  # 二维码整体上下偏移（正值向上）
+        # -----------------------------------------------------------------
 
-        # 尺寸定义
         L_WIDTH, L_HEIGHT = 70 * mm, 50 * mm
         ROWS, COLS = 6, 6
         col_w = L_WIDTH / COLS
-        row_h = L_HEIGHT / ROWS # 6x6 网格的原始行高
-        half_row_h = row_h / 2 # QSO信息行被分为上下两部分
+        row_h = L_HEIGHT / ROWS
+        half_row_h = row_h / 2
 
         try:
             fonts = NewLayoutPrinter._setup_fonts()
             c = canvas.Canvas(pdf_buffer, pagesize=(L_WIDTH, L_HEIGHT))
             
+            # --- 第一部分：生成 QSO 数据页 ---
             logs_per_page = 4
             log_chunks = [log_data_list[i:i + logs_per_page] for i in range(0, len(log_data_list), logs_per_page)]
 
@@ -550,88 +557,114 @@ class NewLayoutPrinter:
                 c.drawImage(qr_image_reader, draw_x, draw_y, width=qr_size_mm, height=qr_size_mm)
 
                 c.showPage()
+            # --- 第二部分：生成额外的一页（QSL ID + 二维码） ---
+            # 1. 生成二维码图像
+            qr = qrcode.QRCode(version=None, error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=10, border=0)
+            qr.add_data(qsl_id)
+            qr.make(fit=True)
+            img = qr.make_image(fill_color="black", back_color="white").convert('RGB')
+            img_buffer = BytesIO()
+            img.save(img_buffer, format='PNG')
+            img_buffer.seek(0)
+            qr_image_reader = ImageReader(img_buffer)
 
-            c.save()
-            # ----------------------------------------------------
-            # ✨ 关键：生成成功后，立即弹出提示框 (新增)
-            # ----------------------------------------------------
-            QMessageBox.information(
-                parent_widget, 
-                "标签生成成功", 
-                #f"QSL 标签 ({L_WIDTH/mm}mm x {L_HEIGHT/mm}mm, 版式 1) 已生成文件。即将发送到打印队列！"
-                f"QSL 标签 (70mm x 50mm) 已生成文件。即将发送到打印队列！"
-            )
-        # ----------------------------------------------------
-
-            # 1. 导出 PNG 用于界面预览
-            NewLayoutPrinter._render_and_output_as_png(qsl_id, pdf_buffer, parent_widget)
+            # 2. 计算中心位置
+            center_x = L_WIDTH / 2
+            center_y = L_HEIGHT / 2 + QR_PAGE_Y_OFFSET
             
-            # 2. 保存 PDF 临时文件并触发打印
-            temp_pdf_path = os.path.join(PRINTS_DIR, f"{qsl_id}.pdf") # ✨ 修正：文件名和目录
+            # 3. 绘制二维码
+            draw_x = center_x - (QR_PAGE_SIZE_MM / 2)
+            draw_y = center_y - (QR_PAGE_SIZE_MM / 2)
+            c.drawImage(qr_image_reader, draw_x, draw_y, width=QR_PAGE_SIZE_MM, height=QR_PAGE_SIZE_MM)
+            
+            # 4. 绘制 ID 文本 (居中在二维码下方)
+            text_y = draw_y + QR_PAGE_SIZE_MM - 45*mm
+            NewLayoutPrinter._draw_mixed_string(c, center_x, text_y, f"{qsl_id}", fonts, QR_PAGE_FONT_SIZE, align='center')
+            
+            c.showPage() # 结束二维码页
+
+            # --- 保存与打印 ---
+            c.save()
+            QMessageBox.information(parent_widget, "生成成功", f"已生成 QSL ID/二维码标签（收卡）：{qsl_id}")
+            
+            NewLayoutPrinter._render_and_output_as_png(qsl_id, pdf_buffer, parent_widget)
+            temp_pdf_path = os.path.join(PRINTS_DIR, f"{qsl_id}.pdf")
             with open(temp_pdf_path, "wb") as f:
                 f.write(pdf_buffer.getvalue()) 
-            # 触发打印
             NewLayoutPrinter._print_file(temp_pdf_path)
+
         except Exception as e:
-            QMessageBox.critical(parent_widget, "生成失败", f"生成版式1时出错: {e}")
+            QMessageBox.critical(parent_widget, "生成失败", f"生成出错: {e}")
             import traceback
-            traceback.print_exc()   
-    # Layout 2 保持原样或根据需要修改
+            traceback.print_exc()
+    
     @staticmethod
     def generate_layout_2(qsl_id, log_data_list, parent_widget):
-        os.makedirs(LABELS_DIR, exist_ok=True)
+        """
+        生成 70mm x 50mm 标签（收卡标签）。
+        仅生成 QSL ID 二维码页。
+        （此方法内容复制自原 generate_layout_1 中的第二页逻辑）
+        """
+        os.makedirs(PRINTS_DIR, exist_ok=True)
         pdf_buffer = BytesIO()
+        
+        # 尺寸和常量定义（与 layout_1 的第二页保持一致）
+        L_WIDTH, L_HEIGHT = 70 * mm, 50 * mm
+        QR_PAGE_SIZE_MM = 35 * mm  # 二维码的尺寸 (较大)
+        QR_PAGE_FONT_SIZE = 12     # QSL ID 的字体大小
+        QR_PAGE_Y_OFFSET = 5 * mm  # 二维码整体上下偏移（正值向上）
+        
         try:
             fonts = NewLayoutPrinter._setup_fonts()
-            page_width, page_height = (160*mm, 90*mm)
-            c = canvas.Canvas(pdf_buffer, pagesize=(page_width, page_height))
-            
-            log = dict(log_data_list[0]) if log_data_list else {}
-            
-            date_str = log.get('qso_date')
-            to_radio = str(log.get('station_callsign') or '')
-            day, month, year = "DD", "MM", "YYYY"
-            if date_str:
-                try:
-                    dt_obj = datetime.datetime.strptime(date_str, '%Y%m%d')
-                    day, month, year = dt_obj.strftime('%d'), dt_obj.strftime('%m'), dt_obj.strftime('%Y')
-                except (ValueError, TypeError):
-                    pass
-            
-            NewLayoutPrinter._draw_mixed_string(c, page_width * 0.75, page_height * 0.90, to_radio, fonts, 24)
-            
-            NewLayoutPrinter._draw_mixed_string(c, page_width * 0.10, page_height * 0.55, day, fonts, 14, align='center')
-            NewLayoutPrinter._draw_mixed_string(c, page_width * 0.16, page_height * 0.55, month, fonts, 14, align='center')
-            NewLayoutPrinter._draw_mixed_string(c, page_width * 0.25, page_height * 0.55, year, fonts, 14, align='center')
-            NewLayoutPrinter._draw_mixed_string(c, page_width * 0.36, page_height * 0.55, str(log.get('time_on', '0000')), fonts, 14, align='center')
-            NewLayoutPrinter._draw_mixed_string(c, page_width * 0.65, page_height * 0.55, str(log.get('freq', '')), fonts, 14, align='center')
-            NewLayoutPrinter._draw_mixed_string(c, page_width * 0.80, page_height * 0.55, str(log.get('mode', '')), fonts, 14, align='center')
-            NewLayoutPrinter._draw_mixed_string(c, page_width * 0.95, page_height * 0.55, str(log.get('rst_rcvd', '')), fonts, 14, align='center')
+            c = canvas.Canvas(pdf_buffer, pagesize=(L_WIDTH, L_HEIGHT))
 
-            qr_img = qrcode.make(qsl_id)
-            qr_buffer = BytesIO()
-            qr_img.save(qr_buffer, "PNG")
-            qr_buffer.seek(0)
-            c.drawImage(ImageReader(qr_buffer), page_width * 0.65, page_height * 0.05, width=70, height=70, preserveAspectRatio=True)
-
-            c.showPage()
+            # --- QSL ID + 二维码 页 (Page 1) ---
             
-            NewLayoutPrinter._draw_mixed_string(c, page_width / 2, page_height - 50, qsl_id, fonts, 12, align='center')
-            qr_buffer.seek(0)
-            c.drawImage(ImageReader(qr_buffer), (page_width - 100)/2, (page_height-150)/2, width=100, height=100, preserveAspectRatio=True)
+            # 1. 生成二维码图像
+            # 使用高容错率 (H)
+            qr = qrcode.QRCode(version=None, error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=10, border=0)
+            qr.add_data(qsl_id)
+            qr.make(fit=True)
+            img = qr.make_image(fill_color="black", back_color="white").convert('RGB')
+            img_buffer = BytesIO()
+            img.save(img_buffer, format='PNG')
+            img_buffer.seek(0)
+            qr_image_reader = ImageReader(img_buffer)
+
+            # 2. 计算中心位置
+            center_x = L_WIDTH / 2
+            center_y = L_HEIGHT / 2 + QR_PAGE_Y_OFFSET
+            
+            # 3. 绘制二维码
+            draw_x = center_x - (QR_PAGE_SIZE_MM / 2)
+            draw_y = center_y - (QR_PAGE_SIZE_MM / 2)
+            c.drawImage(qr_image_reader, draw_x, draw_y, width=QR_PAGE_SIZE_MM, height=QR_PAGE_SIZE_MM)
+            
+            # 4. 绘制 ID 文本 (居中在二维码下方)
+            text_y = center_y + (QR_PAGE_SIZE_MM / 2) - 45*mm
+            NewLayoutPrinter._draw_mixed_string(c, center_x, text_y, f"{qsl_id}", fonts, QR_PAGE_FONT_SIZE, align='center')
+            
+            c.showPage() # 结束二维码页
+
+            # --- 保存与打印 ---
             c.save()
-            # ----------------------------------------------------
-            # ✨ 关键：生成成功后，立即弹出提示框 (新增)
-            # ----------------------------------------------------
-            QMessageBox.information(
-                parent_widget, 
-                "标签生成成功"
-            )
-        # ----------------------------------------------------
-            NewLayoutPrinter._render_and_output_as_png(qsl_id, pdf_buffer, parent_widget)
-        except Exception as e:
-            QMessageBox.critical(None, "操作失败", f"生成版式2时出错: {e}")
+            # 更改提示信息和文件名后缀，用于收卡区分
+            QMessageBox.information(parent_widget, "收卡标签生成成功", f"已生成 QSL ID/二维码标签（收卡）：{qsl_id}")
+            
+            # 渲染预览图
+            NewLayoutPrinter._render_and_output_as_png(f"{qsl_id}", pdf_buffer, parent_widget)
+            
+            # 临时保存 PDF 并打印
+            temp_pdf_path = os.path.join(PRINTS_DIR, f"{qsl_id}.pdf")
+            with open(temp_pdf_path, "wb") as f:
+                f.write(pdf_buffer.getvalue()) 
+            NewLayoutPrinter._print_file(temp_pdf_path)
 
+        except Exception as e:
+            QMessageBox.critical(parent_widget, "收卡标签生成失败", f"生成出错: {e}")
+            import traceback
+            traceback.print_exc()
+    
     # --- [REPLACE generate_address_label METHOD in NewLayoutPrinter] ---
     @staticmethod
     def generate_address_label(sender_info, receiver_info, parent_widget):
@@ -878,33 +911,68 @@ class NfcWriteDialog(QDialog):
         if NFCWriter.write_to_port(port, baudrate, self.qsl_id, self):
             self.accept()
 
-class PrintLayoutDialog(QDialog):
-    def __init__(self, parent=None):
+class QSLInventoryUpdateDialog(QDialog):
+    """
+    用于批量/快速更新卡片收发日期的对话框。
+    """
+    def __init__(self, db_manager, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("选择打印版式")
-        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
-        self.setFixedSize(350, 150)
-        self.layout_choice = None
+        self.db_manager = db_manager
+        self.setWindowTitle("QSL卡片出入库更新")
+        # 禁用问号帮助按钮和尺寸调整
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint) 
+        self.setFixedSize(1500, 400)
+
+        main_layout = QVBoxLayout(self)
         
-        layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("请选择要使用的打印版式："))
+        info_label = QLabel("请输入QSL卡片ID并按回车（或回车设备扫码）更新收/发卡日期为当前日期：")
+        main_layout.addWidget(info_label)
 
-        self.layout1_button = QPushButton("版式 1 (信息列表式)")
-        self.layout2_button = QPushButton("版式 2 (表格填充式)")
+        self.qsl_id_input = QLineEdit()
+        self.qsl_id_input.setPlaceholderText("输入QSL ID 后回车")
+        # 核心逻辑：输入完成（回车或焦点丢失）时触发处理
+        self.qsl_id_input.editingFinished.connect(self.process_qsl_id)
+        self.qsl_id_input.setFont(QFont("Arial", 14))
+        main_layout.addWidget(self.qsl_id_input)
+
+        self.status_label = QLabel("状态: 等待输入...")
+        self.status_label.setStyleSheet("font-weight: bold; color: #3498db;")
+        main_layout.addWidget(self.status_label)
         
-        self.layout1_button.clicked.connect(self.select_layout1)
-        self.layout2_button.clicked.connect(self.select_layout2)
+        # 确保输入框获得焦点，方便连续操作
+        self.qsl_id_input.setFocus()
 
-        layout.addWidget(self.layout1_button)
-        layout.addWidget(self.layout2_button)
+    def process_qsl_id(self):
+        """处理输入框中的QSL ID，执行数据库更新。"""
+        qsl_id = self.qsl_id_input.text().strip().upper()
+        self.qsl_id_input.clear() # 立即清空输入框，准备下一次输入/扫描
+        
+        if not qsl_id:
+            self.status_label.setText("状态: ID为空，请重新输入。")
+            self.status_label.setStyleSheet("color: #e67e22;")
+            # 重新获得焦点
+            self.qsl_id_input.setFocus()
+            return
 
-    def select_layout1(self):
-        self.layout_choice = 1
-        self.accept()
-
-    def select_layout2(self):
-        self.layout_choice = 2
-        self.accept()
+        self.status_label.setText(f"状态: 正在处理 ID: {qsl_id}...")
+        self.status_label.setStyleSheet("color: #f1c40f;")
+        
+        # 调用数据库方法执行更新
+        success, message = self.db_manager.update_qsl_card_date(qsl_id)
+        
+        # 更新状态标签
+        if success:
+            self.status_label.setText(f"✅ 成功! ID: {qsl_id} - {message}")
+            self.status_label.setStyleSheet("font-weight: bold; color: #2ecc71;")
+            # 通知主窗口更新仪表板统计数据
+            if hasattr(self.parent(), 'update_dashboard_stats'):
+                self.parent().update_dashboard_stats()
+        else:
+            self.status_label.setText(f"❌ 失败! ID: {qsl_id} - {message}")
+            self.status_label.setStyleSheet("font-weight: bold; color: #e74c3c;")
+            
+        # 重新获得焦点，等待下一个 QSL ID
+        self.qsl_id_input.setFocus()
 
 class BatchQslModeDialog(QDialog):
     def __init__(self, log_count, parent=None):
@@ -1484,26 +1552,29 @@ class LogManagementWidget(QWidget):
 
         mode = "multi"
         if len(log_ids_to_process) > 1:
+            # BatchQslModeDialog 仍然保留，用于处理 QSL ID 的归并逻辑
             dialog = BatchQslModeDialog(len(log_ids_to_process), self)
             if dialog.exec() == QDialog.Accepted: mode = dialog.mode
             else: return
 
-        if DEFAULT_TO_LAYOUT_1 == True:
-        # 如果DEFAULT_TO_LAYOUT_1为True，直接使用layout 1
-            self.run_print_job(NewLayoutPrinter.generate_layout_1, log_ids_to_process, direction, mode)
+        # --- 移除 DEFAULT_TO_LAYOUT_1 判定和 PrintLayoutDialog 调用 ---
+        if direction == 'TC':
+            # 发卡 (TC): 使用 layout 1 (QSO 数据 + QSLID 二维码)
+            layout_func = NewLayoutPrinter.generate_layout_1
+            #QMessageBox.information(self, "打印模式", f"发卡标签打印：(版式 1)")
+        elif direction == 'RC':
+            # 收卡 (RC): 使用 layout 2 (纯 QSLID 二维码)
+            layout_func = NewLayoutPrinter.generate_layout_2
+            #QMessageBox.information(self, "打印模式", f"收卡标签打印：(版式 2)")
         else:
-        # 否则显示对话框让用户选择layout
-            layout_dialog = PrintLayoutDialog(self)
-            if layout_dialog.exec() != QDialog.Accepted:
-                return
-            if layout_dialog.layout_choice == 1:
-                self.run_print_job(NewLayoutPrinter.generate_layout_1, log_ids_to_process, direction, mode)
-            elif layout_dialog.layout_choice == 2:
-                self.run_print_job(NewLayoutPrinter.generate_layout_2, log_ids_to_process, direction, mode)
+            #QMessageBox.critical(self, "操作失败", "无法识别的操作方向。")
+            return
+            
+        self.run_print_job(layout_func, log_ids_to_process, direction, mode)
+        # --- 打印逻辑结束 ---
         
         self.apply_filters()
         self.data_changed_signal.emit()
-
     def run_print_job(self, print_function, log_ids, direction, mode):
         processed_count = 0
         if mode == "single":
@@ -1542,8 +1613,15 @@ class LogManagementWidget(QWidget):
 
         dialog = CardActionDialog("选择要补打的标签", cards, self)
         if dialog.exec_() == QDialog.Accepted and dialog.selected_card_info:
-            qsl_id_to_print = dialog.selected_card_info['qsl_id']
-
+            
+            # --- 修正 1：将 sqlite3.Row 转换为 dict ---
+            # 解决 AttributeError，并方便访问键值
+            selected_card_info_dict = dict(dialog.selected_card_info)
+            
+            qsl_id_to_print = selected_card_info_dict['qsl_id']
+            # --- 关键修正 2：直接使用 CardActionDialog 返回的 'direction' 键 ---
+            card_direction = selected_card_info_dict.get('direction', '')
+            
             logs_for_this_card = self.db_manager.get_logs_for_qsl_card(qsl_id_to_print)
             if not logs_for_this_card:
                 QMessageBox.critical(self, "数据库错误", f"找不到卡号 {qsl_id_to_print} 关联的日志。")
@@ -1551,16 +1629,18 @@ class LogManagementWidget(QWidget):
 
             log_data_list = [self.db_manager.get_log_details(lid['log_id']) for lid in logs_for_this_card]
 
-            if DEFAULT_TO_LAYOUT_1 == True:
+            # --- 根据明确的 direction 自动选择版式 ---
+            if card_direction == 'RC':
+                # 补打收卡标签：使用 layout 2 (纯 QSLID二维码)
+                #QMessageBox.information(self, "补打模式", f"补打收卡标签：QSL ID {qsl_id_to_print} (版式 2)")
+                NewLayoutPrinter.generate_layout_2(qsl_id_to_print, log_data_list, self)
+            elif card_direction == 'TC':
+                # 补打发卡标签：使用 layout 1 (QSO数据网格 + QSLID二维码)
+                #QMessageBox.information(self, "补打模式", f"补打发卡标签：QSL ID {qsl_id_to_print} (版式 1)")
                 NewLayoutPrinter.generate_layout_1(qsl_id_to_print, log_data_list, self)
-            else: 
-                layout_dialog = PrintLayoutDialog(self)
-                if layout_dialog.exec() != QDialog.Accepted: return
-                if layout_dialog.layout_choice == 1:
-                    NewLayoutPrinter.generate_layout_1(qsl_id_to_print, log_data_list, self)
-                elif layout_dialog.layout_choice == 2:
-                    NewLayoutPrinter.generate_layout_2(qsl_id_to_print, log_data_list, self)
-
+            else:
+                QMessageBox.warning(self, "补打失败", 
+                                    f"无法确定 QSL ID {qsl_id_to_print} 的卡片方向 ({card_direction})。")
     def write_nfc_card(self):
         """Handle writing an existing QSL ID to an NFC card."""
         log_ids = self.model.get_checked_log_ids()
@@ -1823,11 +1903,12 @@ class MainWindow(QMainWindow):
             "log_management": ("日志管理", self.on_log_manage_clicked), 
             "import_adif": ("导入ADIF", self.on_import_clicked), 
             "hardware_scan": ("手动查询", self.on_scan_clicked),
-            "address_label": ("打印地址标签", self.on_address_label_clicked), # <--- 新增
-            "settings": ("设置", self.on_settings_clicked)
+            "address_label": ("打印地址标签", self.on_address_label_clicked),
+            "inventory_update": ("卡片出入库更新", self.on_inventory_update_clicked), # <--- 新增此项
+             "settings": ("设置", self.on_settings_clicked)
         }
-        # 更新布局坐标，确保放得下 (3行2列)
-        positions = [(0,0), (0,1), (1,0), (1,1), (2,0), (2,1)] 
+        # 更新布局坐标，确保放得下 (7个瓦片，占用 (3,0) 位置)
+        positions = [(0,0), (0,1), (1,0), (1,1), (2,0), (2,1), (3,0)] 
         # --- [MODIFIED SECTION END] ---
         
         # Unpack items safely
@@ -1843,9 +1924,9 @@ class MainWindow(QMainWindow):
                 tile_layout.addWidget(button, *position)
 
         self.quit_button = QPushButton("退出系统"); self.quit_button.setObjectName("quitButton")
-        # 修改退出按钮的位置到第 3 行，跨两列（如果不想覆盖地址标签按钮，可以调整到 row 3）
+         # 修改退出按钮的位置到第 4 行，跨两列
         self.quit_button.setMinimumSize(180, 120); self.quit_button.clicked.connect(self.close)
-        tile_layout.addWidget(self.quit_button, 3, 0, 1, 2) # Moved to Row 3, Span 2 columns
+        tile_layout.addWidget(self.quit_button, 4, 0, 1, 2) # **将 3 改为 4**
 
         main_hbox.addWidget(tile_widget, 1) # Changed stretch factor
         stats_widget = QFrame(); stats_widget.setFrameShape(QFrame.StyledPanel); stats_vbox = QVBoxLayout(stats_widget)
@@ -1927,7 +2008,10 @@ class MainWindow(QMainWindow):
     def on_scan_clicked(self):
         self.hardware_view.enter_view()
         self.stacked_widget.setCurrentWidget(self.hardware_view)
-        
+    def on_inventory_update_clicked(self):
+        """打开 QSL 卡片出入库更新对话框"""
+        dialog = QSLInventoryUpdateDialog(self.db_manager, self)
+        dialog.exec_()    
     def on_settings_clicked(self): dialog = SettingsDialog(self.db_manager, self); dialog.data_changed.connect(self.update_dashboard_stats); dialog.exec()
     def closeEvent(self, event): self.hardware_view.closeEvent(event); self.db_manager.close(); event.accept()
     def search_by_qsl_id(self, qsl_id):
@@ -2118,6 +2202,87 @@ class DatabaseManager:
         is_linked_elsewhere = self.fetch_one("SELECT 1 FROM qsl_log_link WHERE qsl_id = ?", (qsl_id,))
         if not is_linked_elsewhere: self.execute_query("DELETE FROM qsl_cards WHERE qsl_id = ?", (qsl_id,))
         return True
+    def update_qsl_card_date(self, qsl_id):
+        """
+        根据QSL ID查询关联的日志，并更新对应的收/发卡日期为当前日期。
+        如果数据库中的日期与当前日期不一致，则强制更新。
+        返回 (成功与否, 消息)。
+        """
+        print(f"\n--- DEBUG: Starting QSL Update for ID: {qsl_id} ---")
+        current_date_str = datetime.datetime.now().strftime("%Y%m%d")
+        
+        # 1. 查询 qsl_cards 表以获取卡片方向 (TC/RC)
+        card_row = self.fetch_one("SELECT direction FROM qsl_cards WHERE qsl_id = ?", (qsl_id,))
+        if not card_row:
+            print("--- DEBUG: Failure: QSL ID not found in qsl_cards.")
+            return False, "卡片ID不存在，请检查输入。"
+
+        # 假设 fetch_one 返回的是元组，方向在索引 0
+        direction = card_row[0] if isinstance(card_row, tuple) else card_row['direction']
+        print(f"--- DEBUG: QSL Card Direction: {direction} ---")
+        
+        # 2. 确定要更新的字段和动作文本
+        if direction == 'TC': 
+            update_field = "qsl_sent_date"
+            check_field = "qsl_sent_date"
+            action_text = "标记为已寄出"
+        elif direction == 'RC':
+            update_field = "qsl_rcvd_date"
+            check_field = "qsl_rcvd_date"
+            action_text = "标记为已收到"
+        else:
+            print("--- DEBUG: Failure: Unknown direction.")
+            return False, f"卡片方向 ({direction}) 未知。"
+            
+        # 3. 查找所有关联的 log_id 和对应的当前日期状态
+        log_data = self.fetch_all(f"""
+            SELECT l.id, l.{check_field}
+            FROM logs l
+            JOIN qsl_log_link qll ON l.id = qll.log_id
+            WHERE qll.qsl_id = ?
+        """, (qsl_id,))
+
+        if not log_data:
+            print("--- DEBUG: Failure: No associated logs found.")
+            return False, "未找到该卡片ID关联的通联日志。"
+        
+        print(f"--- DEBUG: Found {len(log_data)} associated logs.")
+
+        # 4. 检查是否需要更新：只有在日期已记录且与当前日期一致时，才跳过更新
+        first_log_date = None
+        for row in log_data:
+            # 假设 fetch_all 返回的是元组列表，日期在索引 1
+            date_value = row[1]
+            if date_value:
+                first_log_date = date_value
+                break
+                
+        if first_log_date:
+            if first_log_date == current_date_str:
+                # 日期一致，无需更新
+                print(f"--- DEBUG: Already Processed Today ({first_log_date}). Aborting update.")
+                return True, f"卡片已于今日 ({first_log_date}) 完成处理，无需重复更新。"
+            else:
+                # 日期不一致 (例如 20251201 != 20251213)，继续执行更新
+                print(f"--- DEBUG: Already Processed on {first_log_date}. Date is stale, forcing update to {current_date_str}.")
+                # 流程继续到 Step 5 (更新)
+        else:
+            # 尚未处理，继续执行更新
+            print("--- DEBUG: Not yet processed. Proceeding to update.")
+            
+        # 5. 执行批量更新
+        log_ids_to_update = [row[0] for row in log_data]
+        placeholders = ','.join('?' for _ in log_ids_to_update)
+        update_query = f"UPDATE logs SET {update_field} = ? WHERE id IN ({placeholders})"
+        params = [current_date_str] + log_ids_to_update
+        
+        if self.execute_query(update_query, params):
+            print("--- DEBUG: Success: Database updated.")
+            return True, f"卡片已成功 {action_text} (日期: {current_date_str})。已更新 {len(log_ids_to_update)} 条日志记录。"
+        else:
+            print("--- DEBUG: Failure: execute_query returned False.")
+            return False, "数据库更新失败。"
+    
     def reset_all_qsl_data(self):
         try:
             self.execute_query("DELETE FROM qsl_log_link")
